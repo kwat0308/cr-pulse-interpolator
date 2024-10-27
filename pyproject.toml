@@ -23,6 +23,12 @@ demo = [
   "matplotlib",
 ]
 
+jax = [
+  "jax",
+  "jaxlib",
+  "interpax",
+]
+
 [project.urls]
 Homepage = "https://github.com/nu-radio/cr-pulse-interpolator"
 Issues = "https://github.com/nu-radio/cr-pulse-interpolator/issues"
