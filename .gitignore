@@ -12,3 +12,5 @@
 # Project settings
 
 .idea/
+
+*.pyc

@@ -10,8 +10,7 @@ import scipy.interpolate as intp
 
 class interp2d_fourier:
     """
-    Produce a callable instance (given by the function __call__) to interpolate a function value(x, y)
-    sampled at the input positions (x, y)
+    Produce a callable instance (given by the function __call__) to interpolate a function value(x, y) sampled at the input positions (x, y).
 
     Parameters
     ----------
@@ -30,10 +29,11 @@ class interp2d_fourier:
     recover_concentric_rings : bool, default=False
         set True if the grid is not purely circular-symmetric; results may not be accurate.
     """
+
     @classmethod
     def get_ordering_indices(cls, x, y):
         """
-        Produces ordering indices to create (radius, phi) 2D-array from unordered x and y (1D-)arrays.
+        Produce ordering indices to create (radius, phi) 2D-array from unordered x and y (1D-)arrays.
 
         Parameters
         ----------
@@ -42,7 +42,6 @@ class interp2d_fourier:
         y : np.ndarray
             1D array of y positions
         """
-
         radius = np.sqrt(x ** 2 + y ** 2)
         phi = np.arctan2(y, x)  # uses interval -pi..pi
         phi = np.around(phi, 15)  # based on observation that offsets from 0 up to 1e-16 can result from arctan2
@@ -66,7 +65,7 @@ class interp2d_fourier:
     @classmethod
     def cos_sin_components(cls, fourier):
         """
-        Convert complex FFT as from np.fft.rfft to real-valued cos, sin components
+        Convert complex FFT as from np.fft.rfft to real-valued cos, sin components.
 
         Parameters
         -----------
@@ -107,6 +106,7 @@ class interp2d_fourier:
         self.angular_FFT = np.fft.rfft(values_ordered, axis=1)
         length = values_ordered.shape[-1]
         self.angular_FFT /= float(length)  # normalize
+        print(self.radial_axis.shape, self.angular_FFT.shape)
 
         # Produce interpolator function, interpolating the FFT components as a function of radius
 
@@ -118,7 +118,7 @@ class interp2d_fourier:
 
     def __call__(self, x, y, max_fourier_mode=None):
         """
-        Interpolate the input used in __init__ for input positions (x, y)
+        Interpolate the input used in __init__ for input positions (x, y).
 
         Parameters
         ----------
