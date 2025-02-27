@@ -11,7 +11,7 @@ import cr_pulse_interpolator.interpolation_fourier as interpF
 
 class interp2d_signal:
     """
-    Initialize a callable signal interpolator object
+    Initialize a callable signal interpolator object.
 
     Parameters
     ----------
@@ -56,6 +56,7 @@ class interp2d_signal:
     def get_spectra(self, signals):
         """
         Do FFT of 'signals', assumed shape (Nants, Nsamples, Npol) i.e. the time traces are along the second axis.
+
         Produce absolute-amplitude spectrum and phase spectrum
 
         Parameters
@@ -83,6 +84,7 @@ class interp2d_signal:
                                 do_hilbert_envelope=True):
         """
         Produce pulse arrival times from Hilbert envelope maxima (if do_hilbert_envelope) or from raw E-field maxima.
+
         Assumed shape for `signals` is (Nant, Nsamples, Npols), i.e. time traces along second axis.
         Filtering is done between `lowfreq` and `highfreq` in MHz and the timing is done on
         filtered signals (after inverse-FFT).
@@ -161,7 +163,7 @@ class interp2d_signal:
     @staticmethod
     def phase_wrap(phases):
         """
-        wrap `phases` (float or any array shape) into interval (-pi, pi)
+        Wrap `phases` (float or any array shape) into interval (-pi, pi).
 
         Parameters
         ----------
@@ -172,7 +174,8 @@ class interp2d_signal:
 
     def timing_corrected_phases(self, freqs, phase_spectrum, pulse_timings):
         """
-        Take phase_spectrum as input
+        Take phase_spectrum as input.
+
         Account for a linear function from the pulse_timings, i.e. according to delta_phi = 2 pi f delta_t
         Return as timing-corrected phase spectrum
 
@@ -205,7 +208,8 @@ class interp2d_signal:
     @staticmethod
     def phase_unwrap_2d(x, y, phases):
         """
-        Basic method to unwrap phases in 2D
+        Unwrap phases in 2D.
+
         The general problem of optimal 2D phase unwrapping is NP-complete (see ref in article),
         so this will only work for well-behaved, slowly varying phases
         First do 1D unwrap over radial directions
@@ -248,7 +252,7 @@ class interp2d_signal:
 
     def degree_of_coherency(self, low_freq=30.0, high_freq=500.0):
         """
-        This implements Eq. (2.4) in the article, for given frequency band limits
+        Implement Eq. (2.4) in the article, for given frequency band limits.
 
         Parameters
         ----------
@@ -265,7 +269,8 @@ class interp2d_signal:
 
     def get_constant_phases(self, low_freq=30.0, high_freq=500.0):
         """
-        This implements Eq. (2.3) in the article, for given frequency band limits.
+        Inplement Eq. (2.3) in the article, for given frequency band limits.
+
         Phases have been corrected to have maximum Hilbert envelope at "t"=0
         So, add up the complex phases, weighted by the amplitudes, to get the constant phase
         which determines if the pulse is cos-like or sin-like, or a value in between
@@ -286,7 +291,8 @@ class interp2d_signal:
 
     def get_coherency_vs_frequency(self, bandwidth=50.0, low_freq=30.0, high_freq=500.0, coherency_cutoff=0.8):
         """
-        Compute `degree of coherency` as from Eq. (2.4) in a sliding frequency window
+        Compute `degree of coherency` as from Eq. (2.4) in a sliding frequency window.
+
         each with bandwidth 50 MHz (or optional value given)
         Then, see at which frequency this value first drops below 'coherency_cutoff'
         That frequency defines the 'cutoff frequency' (cutoff_freq) below which
@@ -335,7 +341,8 @@ class interp2d_signal:
                                              bandwidth=50.0, upsample_factor=10,
                                              ignore_cutoff_freq_in_timing=False):
         """
-        Implements "method (2)" to account for phase spectra towards higher frequencies.
+        Implement "method (2)" to account for phase spectra towards higher frequencies.
+
         Determines arrival time (E-field maximum) in a 50 MHz (or 'bandwidth') sliding frequency window,
         by filtering to each frequency window and inverse-FFT.
         Arrival time is mapped to phase in the center of each window.
@@ -407,7 +414,8 @@ class interp2d_signal:
 
     def nearest_antenna_index(self, x, y, same_radius=False, tolerance=1.0):
         """
-        Search for closest antenna at the same radius, within tolerance (m), when same_radius=True
+        Search for closest antenna at the same radius, within tolerance (m), when same_radius=True.
+
         Otherwise find the nearest antenna to (x, y) and return its index
         The nearest antenna position is then referenced as self.pos_x[index], self.pos_y[index]
 
@@ -444,7 +452,7 @@ class interp2d_signal:
 
     def get_cutoff_freq(self, x, y, pol):
         """
-        A getter for the cutoff frequency in polarization 'pol' interpolated to arbitrary position (x, y)
+        Get the cutoff frequency in polarization 'pol' interpolated to arbitrary position (x, y).
 
         Parameters
         ----------
@@ -598,7 +606,7 @@ class interp2d_signal:
                  account_for_timing=True, pulse_centered=True,
                  const_time_offset=20.0e-9, full_output=False):
         """
-        Computes the interpolation at arbitrary position (x, y)
+        Compute the interpolation at arbitrary position (x, y).
 
         Parameters
         ----------

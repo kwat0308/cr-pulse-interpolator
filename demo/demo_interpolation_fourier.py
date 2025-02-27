@@ -5,7 +5,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 # plt.ion()
 from matplotlib import cm
-import cr_pulse_interpolator.interpolation_fourier as interpF
+
+import jax
+jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_platform_name", "cpu")
+
+import cr_pulse_interpolator.jax.interpolation_fourier as interpF
+# import cr_pulse_interpolator.interpolation_fourier as interpF
 
 def do_plot_radial(interp_fourier, max_mode=2):
     radial_interpolator = interp_fourier.get_angular_FFT_interpolator()
@@ -15,9 +21,12 @@ def do_plot_radial(interp_fourier, max_mode=2):
     fine_radius = np.arange(0.0, 500.0, 0.5)
 
     fourier_interpolated = radial_interpolator(fine_radius)
+    # print(fourier_interpolated)
 
     (cosines, sines) = interpF.interp2d_fourier.cos_sin_components(fourier)
     (cosines_fine, sines_fine) = interpF.interp2d_fourier.cos_sin_components(fourier_interpolated)
+
+    # print(cosines_fine, sines_fine)
 
     y_0 = cosines_fine[:, 0]
     y_1 = cosines_fine[:, 1]
@@ -72,7 +81,7 @@ data = np.loadtxt(fname)
 (x, y, values) = data.T
 
 ### Get instance of interpolator, using given values for (x, y)
-fourier_interpolator = interpF.interp2d_fourier(x, y, values)
+fourier_interpolator = interpF.interp2d_fourier(x, y, values, fill_value=True)
 ###
 
 # Plot radial dependence of the lowest Fourier components
@@ -115,4 +124,5 @@ ax.set_xlim(-250, 250)
 ax.set_ylim(-250, 250)
 ax.set_aspect('equal')
 
-plt.show()
+# plt.show()
+plt.savefig("./image_jax.png")
