@@ -79,7 +79,7 @@ class interp2d_fourier:
 
         return cos_components, sin_components
 
-    def __init__(self, x, y, values, radial_method='cubic', fill_value='extrapolate', recover_concentric_rings=False):
+    def __init__(self, x, y, values, radial_method='cubic', fill_value='extrapolate', recover_concentric_rings=False, radius_threshold = 0.1):
         # Convert (x, y) to (r, phi), make 2d position array, sorting positions and values by r and phi
         radius = np.sqrt(x ** 2 + y ** 2)
 
@@ -89,7 +89,7 @@ class interp2d_fourier:
         # Store the (unique) radius values
         self.radial_axis = radius[ordering_indices][:, 0]
         # Check if the radius does not vary along angular direction (with tolerance)
-        if np.max(np.std(radius[ordering_indices], axis=1)) > 0.1 * np.min(radius):
+        if np.max(np.std(radius[ordering_indices], axis=1)) > radius_threshold * np.min(radius):
             if not recover_concentric_rings:
                 raise ValueError("Radius must be (approx.) constant along angular direction. "
                                  "You can try to \"fix\" that by using \"recover_concentric_rings=True\"")
