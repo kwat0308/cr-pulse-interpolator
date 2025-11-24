@@ -1,59 +1,330 @@
-# Module for Fourier interpolation of pulsed signals along simulated radio footprints of cosmic-ray air showers
-# Author: A. Corstanje (a.corstanje@astro.ru.nl), 2023
-#
-# See article: A. Corstanje et al 2023 JINST 18 P09005, doi 10.1088/1748-0221/18/09/P09005, arXiv 2306.13514, 
-# Please cite this when using code and/or methods in your analysis
+"""
+Container to perform signal interpolation using Fourier methods.
+"""
 
-import numpy as np
-from scipy.signal import hilbert, resample
-import cr_pulse_interpolator.interpolation_fourier as interpF
+import jax
 
+jax.config.update("jax_enable_x64", True)
 
+from jax import tree_util
+import jax.numpy as jnp
+from jax_radio_tools import trace_utils, shower_utils
+from dataclasses import dataclass, field
+from functools import partial
+
+from typing_extensions import Self, Union, Optional, Dict, Tuple, Any
+
+from .interpolation_fourier import interp2d_fourier
+
+# --------
+# Module-level interpolator-evaluation wrappers
+# These are jitted pure functions that accept arrays as arguments.
+# They build a temporary interpolator (not stored on the object) and evaluate it.
+# The `single_axis` parameter is static for performance; change if you need dynamic behavior.
+# --------
+
+@partial(jax.jit, static_argnames=("single_axis",))
+def _eval_interp2d(pos_x: jnp.ndarray, pos_y: jnp.ndarray, data: jnp.ndarray,
+                   xq: jnp.ndarray, yq: jnp.ndarray, single_axis: bool, ordered_indices : jnp.ndarray) -> jnp.ndarray:
+    """
+    Build a temporary interp2d_fourier interpolator and evaluate it.
+    - pos_x, pos_y: shape (Nants,)
+    - data: shape (Nants, ... ) depending on single_axis
+    - xq, yq: query points, shape (M,)
+    Returns evaluator output.
+    """
+    interp = interp2d_fourier(x=pos_x, y=pos_y, values=data, single_axis=single_axis, ordered_indices=ordered_indices)
+    return interp(xq, yq)
+
+@tree_util.register_pytree_node_class
 class interp2d_signal:
     """
-    Initialize a callable signal interpolator object.
+    Interpolation module for individual traces (signals) using Fourier-based methods.
+
+    The default units for this package are:
+    - time in seconds
+    - frequency in MHz
+
+    Note that this implementation in JAX is different from the original NumPy version in the following way:
+    - the timing method is not (yet?) implemented
+    - only linear interpolation is available
+    - since the timing method is not implemented, we do not compute for the cutoff frequency and the degree of coherency.
 
     Parameters
     ----------
-    x : np.ndarray
-        1D array for the simulated antenna positions (x) in m
-    y : np.ndarray
+    x : jax.typing.ArrayLike
+        1D array of x positions of simulated antennas (in shower plane!)
+    y : jax.typing.ArrayLike
         idem for y
-    signals : np.ndarray
-        3D array of shape (Nant, Nsamples, Npols) with the antennas indexed in the first axis,
-        the time traces in the second axis, and the polarizations in the third.
-    signals_start_times : np.ndarray, optional
-        The absolute start times of the input traces, shaped as (Nant,)
-    lowfreq: float, default=30.0
-        low-frequency limit in MHz, typically set to 30 MHz. If a higher low-frequency limit is desired,
-        it may likely be better to keep it at 30 MHz here, and high-pass filter later.
-    highfreq : float, default=500.0
-        high-frequency limit in MHz, adjustable to e.g. 80 MHz.
-    sampling_period : float, default=0.1e-9
-        the time between samples in the data, in seconds (default is 0.1 ns)
-    phase_method : {"phasor", "timing"}
-        the phase interpolation to use, cf. pg 8 in the article ("Method (1)" vs "Method (2)").
-        The default is "phasor", ie Method (1).
-    radial_method : str, default='cubic'
-        the interp1d method used for radially interpolating Fourier coefficients.
-        Usually set to 'cubic' for cubic splines, in interpolation_fourier.
+    signals : jax.typing.ArrayLike
+        the time traces at positions (x, y), shape (Nants, Nsamples, Npol)
+    signals_start_times : jax.typing.ArrayLike or None
+        the start times of the input signals at positions (x, y), shape (Nants, ), in seconds. If None, assumed to be zero for all antennas.
+    sampling_period : float, default=0.1 ns
+        time step between samples in seconds
+    lowfreq : float, default=30 MHz
+        low frequency cut for Fourier components, in MHz
+    highfreq : float, default=500 MHz
+        high frequency cut for Fourier components, in MHz
+    lowfreq_phase : float, default=30 MHz
+        low frequency cut for calculation of the phase corrections & Hilbert envelope, in MHz
+    highfreq_phase : float, default=80 MHz
+        high frequency cut for calculation of the phase corrections & Hilbert envelope, in MHz
     upsample_factor : int, default=5
-        upsampling factor used for sub-sample timing accuracy.
-    coherency_cutoff_threshold : float, default=0.9
-        the value of Eq. (2.4) that defines the reliable high-frequency limit
-        on each position. Used internally in the "timing" method, also available to the user
-        via self.get_cutoff_freq(x, y, pol) above.
-    allow_extrapolation : bool, default=True
-        if True, the interpolator will attempt to extrapolate the signal to outside the radius of the
-        input starshape. If set to False, calls to positions outside of the interpolation range will
-        return zero-traces, while positions at radii smaller than r_min will return the result at r_min.
-    ignore_cutoff_freq_in_timing : bool, default=False
-        can be set to True when experimenting with the "timing" method without its stopping criterion.
-    verbose : bool, default=False
-        set to True for more info while initializing
+        factor by which to upsample time traces for pulse timing search
     """
 
-    def get_spectra(self, signals):
+    def __init__(
+        self: Self,
+        x: jax.typing.ArrayLike,
+        y: jax.typing.ArrayLike,
+        signals: jax.typing.ArrayLike,
+        signals_start_times : Optional[jax.typing.ArrayLike] = None,
+        sampling_period: float = 1.0e-10,  # in seconds
+        lowfreq : float = 30.0,  # in MHz
+        highfreq : float = 500.0,  # in MHz
+        lowfreq_phase: float = 30.0,  # in MHz
+        highfreq_phase: float = 80.0,  # in MHz,
+        upsample_factor: int = 5,
+    ) -> None:
+        """
+        Initialize all the interpolators that will be used for signal interpolation.
+
+        This includes to compute the following:
+        - FFT spectra of the input signals
+        - Pulse timings (summed over all polarizations) using Hilbert envelope (in 30-80 MHz band)
+        - Timing-corrected phase spectra
+        - constant phase component in [30, 80] MHz band
+        - constructing the Fourier interpolator for all quantities:
+            - absolute amplitude spectrum
+            - timing-corrected phase spectrum (cos and sin components)
+            - pulse timings
+            - constant phase component
+            - arrival times, if provided
+
+        Parameters
+        ----------
+        x : jax.typing.ArrayLike
+            1D array of x positions of simulated antennas (in shower plane!)
+        y : jax.typing.ArrayLike
+            idem for y
+        signals : jax.typing.ArrayLike
+            the time traces at positions (x, y), shape (Nants, Nsamples, Npol)
+        signals_start_times : jax.typing.ArrayLike or None
+            the start times of the input signals at positions (x, y), shape (Nants, ), in seconds. If None, assumed to be zero for all antennas.
+        sampling_period : float, default=0.1 ns
+            time step between samples in seconds
+        lowfreq : float, default=30 MHz
+            low frequency cut for Fourier components, in MHz
+        highfreq : float, default=500 MHz
+            high frequency cut for Fourier components, in MHz
+        lowfreq_phase : float, default=30 MHz
+            low frequency cut for calculation of the phase corrections & Hilbert envelope, in MHz
+        highfreq_phase : float, default=80 MHz
+            high frequency cut for calculation of the phase corrections & Hilbert envelope, in MHz
+        upsample_factor : int, default=5
+            factor by which to upsample time traces for pulse timing search
+        """
+        self.pos_x = jnp.asarray(x)
+        self.pos_y = jnp.asarray(y)
+        (Nants, Nsamples, Npols) = signals.shape  # hard assumption, 3D...
+        self.trace_length = Nsamples
+        self.sampling_period = sampling_period
+        self.lowfreq = lowfreq  
+        self.highfreq = highfreq
+
+        self.ordered_indices = shower_utils.get_ordering_indices(
+            self.pos_x, self.pos_y
+        )  # shape (Nrad, Nphi)
+
+        # store the other shapes too
+        self.Nants = Nants
+        self.Npols = Npols
+
+        # first obtain the frequency spectra
+        freqs, _, abs_spectrum, phase_spectrum, _ = self.get_spectra(
+            signals
+        )  # shapes ((Nfreq,), (Nants, Nfreq, Npol), ...)
+
+        self.freqs = freqs # store frequency grid
+
+        # get the pulse timings
+        pulse_timings = self.get_pulse_timings(
+            signals,
+            lowfreq=lowfreq_phase,
+            highfreq=highfreq_phase,
+            upsample_factor=upsample_factor,
+        )  # shape (Nants, )
+
+        phase_spectra_corrected = self.get_timing_corrected_phases(
+            freqs, phase_spectrum, pulse_timings
+        )  # shape (Nants, Nfreq, Npol)
+
+        # get constant phases 
+        const_phases_unwrapped = self.get_constant_phases(
+            abs_spectrum,
+            phase_spectra_corrected,
+            lowfreq=lowfreq_phase,
+            highfreq=highfreq_phase,
+        )  # shape (Nants, Npol)
+
+        # now we calculated the corrected phase spectra, subtracted by the constant phase
+        phase_spectra_corrected = phase_spectra_corrected - const_phases_unwrapped[:, None, :]
+
+        # store the minimal arrays required to reconstruct signals later
+        # store cos/sin of corrected phases to keep interpolation of phase stable
+        self.abs_spectrum = jnp.asarray(abs_spectrum)  # (Nants, Nfreq, Npol)
+        self.phase_cos = jnp.cos(phase_spectra_corrected)
+        self.phase_sin = jnp.sin(phase_spectra_corrected)
+
+        self.pulse_timings = jnp.asarray(pulse_timings)  # (Nants,)
+        self.const_phases = jnp.asarray(const_phases_unwrapped)  # (Nants, Npol)
+
+        if signals_start_times is not None:
+            self.start_times = jnp.asarray(signals_start_times)
+        else:
+            self.start_times = None
+
+    # -----------------
+    # PyTree helpers
+    # -----------------
+    def tree_flatten(self) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+        # Children (leaves) => arrays that JAX should see as dynamic
+        children = (
+            self.pos_x,
+            self.pos_y,
+            self.freqs,
+            self.abs_spectrum,
+            self.phase_cos,
+            self.phase_sin,
+            self.pulse_timings,
+            self.const_phases,
+            self.start_times,
+            self.ordered_indices
+        )
+
+        # Aux (static small metadata)
+        aux = dict(
+            trace_length=self.trace_length,
+            sampling_period=self.sampling_period,
+            lowfreq=self.lowfreq,
+            highfreq=self.highfreq,
+            Nants=self.Nants,
+            Npols=self.Npols,
+        )
+        return children, aux
+
+    @classmethod
+    def tree_unflatten(cls, aux: Dict[str, Any], children: Tuple[Any, ...]) -> "interp2d_signal":
+        # reconstruct object without running __init__
+        obj = cls.__new__(cls)
+        (
+            obj.pos_x,
+            obj.pos_y,
+            obj.freqs,
+            obj.abs_spectrum,
+            obj.phase_cos,
+            obj.phase_sin,
+            obj.pulse_timings,
+            obj.const_phases,
+            obj.start_times,
+            obj.ordered_indices
+        ) = children
+
+        # restore aux
+        obj.trace_length = int(aux["trace_length"])
+        obj.sampling_period = float(aux["sampling_period"])
+        obj.lowfreq = float(aux["lowfreq"])
+        obj.highfreq = float(aux["highfreq"])
+        obj.Nants = int(aux["Nants"])
+        obj.Npols = int(aux["Npols"])
+
+        return obj
+
+    @staticmethod
+    def phase_wrap(phases: jax.typing.ArrayLike) -> jax.typing.ArrayLike:
+        """
+        Wrap `phases` (float or any array shape) into interval (-pi, pi).
+
+        Parameters
+        ----------
+        phases : array_like
+            The values to wrap into interval (-pi, pi)
+
+        Returns
+        -------
+        jax.typing.ArrayLike
+            The wrapped phases into interval (-pi, pi)
+        """
+        return (phases + jnp.pi) % (2 * jnp.pi) - jnp.pi
+
+    @staticmethod
+    def phase_unwrap_2d(
+        x: jax.typing.ArrayLike, y: jax.typing.ArrayLike, phases: jax.typing.ArrayLike
+    ) -> jax.typing.ArrayLike:
+        """
+        Unwrap the phases in 2D.
+
+        Basically we unwrap along radial then azimuthal directions.
+
+        Parameters
+        ----------
+        x : jax.typing.ArrayLike
+            x positions of antennas
+        y : jax.typing.ArrayLike
+            y positions of antennas
+        phases : jax.typing.ArrayLike
+            phases to unwrap, shape (Nants, Npol)
+
+        Returns
+        -------
+        jax.typing.ArrayLike
+            unwrapped phases, shape (Nants, Npol)
+        """
+        indices = shower_utils.get_ordering_indices(x, y)
+        ordered_phases = phases[indices]
+
+        # First along radial axis, then angular axis
+        phases_unwrapped_2d = jnp.unwrap(ordered_phases, axis=0)
+        phases_unwrapped_2d = jnp.unwrap(phases_unwrapped_2d, axis=1)
+
+        # # Back into original 1D shape...
+        phases_unwrapped = jnp.zeros(phases.shape)
+
+        (Nradial, Nangular, Npol) = phases_unwrapped_2d.shape
+
+        phases_unwrapped = phases_unwrapped.at[indices.ravel()].set(
+            phases_unwrapped_2d.reshape((Nradial * Nangular, Npol))
+        )
+
+        return phases_unwrapped
+
+    @staticmethod
+    def get_freq_mask(
+        freqs: jax.typing.ArrayLike,
+        low_freq: jax.typing.ArrayLike,
+        high_freq: jax.typing.ArrayLike,
+    ) -> jax.typing.ArrayLike:
+        """
+        Get a boolean mask for frequencies within [low_freq, high_freq]
+
+        Parameters
+        ----------
+        freqs : jax.typing.ArrayLike
+            Frequency grid in MHz
+        low_freq : float
+            Low frequency cut in MHz
+        high_freq : float
+            High frequency cut in MHz
+
+        Returns
+        -------
+        jax.typing.ArrayLike
+            Boolean mask for frequencies within [low_freq, high_freq]
+        """
+        return (freqs >= low_freq) & (freqs <= high_freq)
+
+    def get_spectra(self: Self, signals: jnp.ndarray) -> tuple:
         """
         Do FFT of 'signals', assumed shape (Nants, Nsamples, Npol) i.e. the time traces are along the second axis.
 
@@ -63,697 +334,254 @@ class interp2d_signal:
         ----------
         signals : np.ndarray
             the input time traces, shaped as (Nants, Nsamples, Npol)
+
+        Returns
+        -------
+        freqs : jnp.ndarray
+            Frequencies corresponding to FFT components, in MHz
+        all_antennas_spectrum : jnp.ndarray
+            The complex FFT spectrum for all antennas, shape (Nants, Nfreq, Npol)
+        abs_spectrum : jnp.ndarray
+            The absolute amplitude spectrum for all antennas, shape (Nants, Nfreq, Npol)
+        phasespectrum : jnp.ndarray
+            The phase spectrum for all antennas, shape (Nants, Nfreq, Npol)
+        unwrapped_phases : jnp.ndarray
+            The unwrapped phase spectrum for all antennas, shape (Nants, Nfreq, Npol)
         """
         Nsamples = signals.shape[1]
+        all_antennas_spectrum = jnp.fft.rfft(signals, axis=1)
+        abs_spectrum = jnp.abs(all_antennas_spectrum)
+        phasespectrum = jnp.angle(all_antennas_spectrum)
+        unwrapped_phases = jnp.unwrap(phasespectrum, axis=1, discont=0.7 * jnp.pi)
 
-        if self.verbose:
-            print('Doing FFTs...', end=' ')
-        all_antennas_spectrum = np.fft.rfft(signals, axis=1)
-        abs_spectrum = np.abs(all_antennas_spectrum)
-        phasespectrum = np.angle(all_antennas_spectrum)
-        unwrapped_phases = np.unwrap(phasespectrum, axis=1, discont=0.7 * np.pi)
-        if self.verbose:
-            print('done.')
-
-        freqs = np.fft.rfftfreq(Nsamples, d=self.sampling_period)
+        freqs = jnp.fft.rfftfreq(Nsamples, d=self.sampling_period)  # in Hz
         freqs /= 1.0e6  # in MHz
 
-        return freqs, all_antennas_spectrum, abs_spectrum, phasespectrum, unwrapped_phases
+        return (
+            freqs,
+            all_antennas_spectrum,
+            abs_spectrum,
+            phasespectrum,
+            unwrapped_phases,
+        )
 
-    def hilbert_envelope_timing(self, signals, lowfreq=30.0, highfreq=500.0, upsample_factor=10, sum_over_pol=True,
-                                do_hilbert_envelope=True):
+    def get_pulse_timings(
+        self: Self,
+        signals: jax.typing.ArrayLike,
+        lowfreq: float = 30.0,
+        highfreq: float = 80.0,
+        upsample_factor: int = 5,
+    ) -> jax.typing.ArrayLike:
         """
-        Produce pulse arrival times from Hilbert envelope maxima (if do_hilbert_envelope) or from raw E-field maxima.
+        Get pulse timings using a Hilbert envelope. The sum over all polarizations are taken by default.
 
-        Assumed shape for `signals` is (Nant, Nsamples, Npols), i.e. time traces along second axis.
-        Filtering is done between `lowfreq` and `highfreq` in MHz and the timing is done on
-        filtered signals (after inverse-FFT).
-        Option `sum_over_pol` is to sum the square of the Hilbert envelopes of each polarization, to get one arrival
-        time over all polarizations (may help at low signal strength), default True.
+        Note that the default bandwidths should be taken (30-80 MHz) since we want to correct the timings & phases within the region where
+        the phase spectra is linear.
 
         Parameters
         ----------
         signals : np.ndarray
-            3D array of shape (Nant, Nsamples, Npols)
-        lowfreq : float, default=30.0
-            low-frequency cutoff in MHz
-        highfreq : float, default=500.0
-            high-frequency cutoff in MHz
-        upsample_factor : int, default=10
-            upsampling factor to use for sub-sample timing accuracy
-        sum_over_pol : bool, default=True
-            Whether to sum over polarizations if do_hilbert_envelope
-        do_hilbert_envelope : bool, default=True
-            If True, use Hilbert envelope for timing. Else use the direct E-field maximum.
+            The input time traces, shaped as (Nants, Nsamples, Npol)
+        lowfreq : float, default=30 MHz
+            Low frequency cut for bandpass filter in MHz
+        highfreq : float, default=80 MHz
+            High frequency cut for bandpass filter in MHz
+        upsample_factor : int, default=5
+            Upsampling factor for better timing resolution
+
+        Returns
+        -------
+        pulse timings : np.ndarray
+            The timing of the pulse per antenna. Shaped as (Nants, ) in units of seconds.
+            Note that the timings are the same for all polarizations
         """
-        (Nant, Nsamples, Npols) = signals.shape
+        # remap for jax radio tools functions
+        signals_jrt = jnp.transpose(signals, (2, 0, 1))  # shape (Npol, Nants, Nsamples)
 
-        if self.verbose:
-            print('Bandpass filtering %d to %d MHz' % (int(lowfreq), int(highfreq)))
-        spectrum = np.fft.rfft(signals, axis=1)
-        freqs = np.fft.rfftfreq(Nsamples, d=self.sampling_period)
-        freqs /= 1.0e6  # in MHz
-        filtering_out = np.where((freqs < lowfreq) | (freqs > highfreq))  # or!
+        # filter the traces
+        filter_traces_jrt = trace_utils.filter_trace(
+            signals_jrt,
+            self.sampling_period,
+            f_min=lowfreq * 1.0e6,  # in Hz
+            f_max=highfreq * 1.0e6,  # in Hz
+            sample_axis=2,
+        )  # shape (Npol, Nants, Nsamples)
 
-        spectrum[:, filtering_out, :] *= 0.0
-        filtered_signals = np.fft.irfft(spectrum, axis=1)
+        # upsample traces
+        upsampled_traces_jrt = trace_utils.resample_trace(
+            filter_traces_jrt,
+            dt_sample=self.sampling_period,
+            dt_resample=self.sampling_period / upsample_factor,
+            sample_axis=2,
+        )  # shape (Npol, Nants, Nsamples * upsample_factor)
 
-        # Get strongest polarization
-        power_per_pol = np.sum(np.sum(filtered_signals ** 2, axis=1), axis=0)
-        strongest_pol = np.argmax(power_per_pol)
-        if self.verbose:
-            print('Strongest polarization is %d' % strongest_pol)
+        # # shift traces to center
+        shifted_traces = trace_utils.shift_trace_to_center(
+            upsampled_traces_jrt, sample_axis=2
+        )
 
-        timestep = self.sampling_period  # in s
-        if self.verbose:
-            print('Upsampling by a factor %d' % upsample_factor)
-        signals_upsampled = resample(filtered_signals, upsample_factor * Nsamples, axis=1)
+        hilbert_envelope = jnp.abs(trace_utils.hilbert(shifted_traces, sample_axis=2))
 
-        nof_samples = signals_upsampled.shape[1]
-        signals_upsampled = np.roll(
-            signals_upsampled, nof_samples // 2, axis=1
-        )  # Put in the middle of the block, avoiding negative values in timing
+        # summing over polarisations
+        hilbert_sum = jnp.sqrt(jnp.sum(hilbert_envelope**2, axis=0))
 
-        if do_hilbert_envelope:
-            if self.verbose:
-                print('Hilbert envelope')
-            hilbert_envelope = np.abs(hilbert(signals_upsampled, axis=1))
+        # remove unnecessary variables to save memory
+        del upsampled_traces_jrt
 
-            if sum_over_pol:
-                hilbert_sum_over_pol = np.sqrt(np.sum(hilbert_envelope ** 2, axis=2))
+        # finding the indicies of the pulse maximum for each antenna position
+        arrival_times = (
+            jnp.argmax(hilbert_sum, axis=-1) - shifted_traces.shape[2] // 2
+        ) * (
+            self.sampling_period / upsample_factor
+        )  # shape (Nants,)
 
-                pulse_timings = (np.argmax(hilbert_sum_over_pol, axis=1) - nof_samples // 2) * (timestep / upsample_factor)
-            else:
-                pulse_timings_per_pol = (np.argmax(hilbert_envelope, axis=1) - nof_samples // 2) * (timestep / upsample_factor)
+        return arrival_times
 
-        else:
-            pulse_timings_per_pol = (np.argmax(signals_upsampled, axis=1) - nof_samples // 2) * (
-                        timestep / upsample_factor)
-
-        if self.verbose:
-            print('Timings done')
-
-        if do_hilbert_envelope and sum_over_pol:
-            pulse_timings_per_pol = np.zeros((Nant, Npols))
-            for pol in range(Npols):
-                pulse_timings_per_pol[:, pol] += pulse_timings  # want to do this without yucky for loop
-
-        return pulse_timings_per_pol
-
-    @staticmethod
-    def phase_wrap(phases):
+    def get_timing_corrected_phases(
+        self: Self,
+        freq: jax.typing.ArrayLike,
+        phase_spectrum: jax.typing.ArrayLike,
+        pulse_timings: jax.typing.ArrayLike,
+    ) -> jax.typing.ArrayLike:
         """
-        Wrap `phases` (float or any array shape) into interval (-pi, pi).
+        Get the timing-corrected phase spectrum.
+
+        This basically removes the timing information from the given phase spectra.
 
         Parameters
         ----------
-        phases : array_like
-            The values to wrap into interval (-pi, pi)
-        """
-        return (phases + np.pi) % (2 * np.pi) - np.pi
-
-    def timing_corrected_phases(self, freqs, phase_spectrum, pulse_timings):
-        """
-        Take phase_spectrum as input.
-
-        Account for a linear function from the pulse_timings, i.e. according to delta_phi = 2 pi f delta_t
-        Return as timing-corrected phase spectrum
-
-        Parameters
-        ----------
-        freqs : np.ndarray
-            frequency axis of FFTs
+        freq : np.ndarray
+            Frequency grid in MHz, shaped as (Nfreq, )
         phase_spectrum : np.ndarray
-            3D array of shape (Nants, Nphases, Npols) containing phase spectra
+            Phase spectrum, shaped as (Nants, Nfreq, Npol)
         pulse_timings : np.ndarray
-            2D array of shape (Nants, Npols) containing pulse timings
+            Pulse timings per antenna in seconds, shaped as (Nants, )
+
+        Returns
+        -------
+        phase_spectrum_corrected : np.ndarray
+            Timing-corrected phase spectrum, shaped as (Nants, Nfreq, Npol)
         """
-        (Nants, Nphases, Npols) = phase_spectrum.shape
+        phase_corrections = (
+            2 * jnp.pi * (freq[None, :, None] * 1.0e6) * pulse_timings[:, None, None]
+        )  # shape (Nants, Nfreq, Npol)
+        phase_spectrum_corrected = (
+            phase_spectrum + phase_corrections
+        )  # shape (Nants, Nfreq, Npol)
 
-        phase_spectrum_corrected = np.zeros(phase_spectrum.shape)
-
-        for i, ant in enumerate(range(Nants)):
-            for pol in range(Npols):
-                this_phase_corrections = 2 * np.pi * (freqs * 1.0e6) * pulse_timings[i, pol]  # plus or minus sign?
-                phase_spectrum_corrected[ant, :, pol] = phase_spectrum[ant, :,
-                                                        pol] + this_phase_corrections  # this can be done more efficiently...
-
-        # WRAP phases into 0..2*pi
+        # wrap phases into [0, 2pi]
         phase_spectrum_corrected = self.phase_wrap(phase_spectrum_corrected)
-        phase_spectrum_corrected = np.unwrap(phase_spectrum_corrected, axis=1, discont=0.7 * np.pi)
-        # needed?
+        phase_spectrum_corrected = jnp.unwrap(
+            phase_spectrum_corrected, axis=1, discont=0.7 * jnp.pi
+        )
 
         return phase_spectrum_corrected
 
-    @staticmethod
-    def phase_unwrap_2d(x, y, phases):
+    def get_constant_phases(
+        self: Self,
+        abs_spectrum: jax.typing.ArrayLike,
+        phase_spectrum_corrected: jax.typing.ArrayLike,
+        lowfreq: float = 30.0,
+        highfreq: float = 80.0,
+    ) -> jax.typing.ArrayLike:
         """
-        Unwrap phases in 2D.
-
-        The general problem of optimal 2D phase unwrapping is NP-complete (see ref in article),
-        so this will only work for well-behaved, slowly varying phases
-        First do 1D unwrap over radial directions
-        Then 1D unwrap over angular directions (along circles in the radial grid)
+        Get the Hilbert phase from the amplitude spectrum and timing-corrected phase spectrum. This corresponds to the phase constant obtained after taking out the time shift and angle from the complex spectrum.
 
         Parameters
         ----------
-        x : np.ndarray
-            1D array of antenna position x (in any order)
-        y : np.ndarray
-            same for y (same order)
-        phases : np.ndarray
-            1D array, i.e. one phase per antenna (same order of antennas as x, y)
+        abs_spectrum : np.ndarray
+            Amplitude spectrum, shaped as (Nants, Nfreq, Npol)
+        phase_spectrum_corrected : np.ndarray
+            Timing-corrected phase spectrum, shaped as (Nants, Nfreq, Npol)
+        lowfreq : float
+            Low frequency cut for bandpass filter in MHz
+        highfreq : float
+            High frequency cut for bandpass filter in MHz
+
+        Returns
+        -------
+        const_phases_unwrapped : np.ndarray
+            The unwrapped constant phases per antenna and polarization, shaped as (Nants, Npol)
         """
-        # Put them into a 2D array with a radial and an angular axis
-        indices = interpF.interp2d_fourier.get_ordering_indices(x, y)
-        phases_ordered = phases[indices]
+        complex_spectrum = abs_spectrum * jnp.exp(
+            1.0j * phase_spectrum_corrected
+        )  # shape (Nants, Nfreq, Npol)
+        freq_mask = self.get_freq_mask(self.freqs, lowfreq, highfreq)  # shape (Nfreq)
 
-        # First along radial axis, then angular axis
-        phases_unwrapped_2d = np.unwrap(phases_ordered, axis=0)
-        phases_unwrapped_2d = np.unwrap(phases_unwrapped_2d, axis=1)
+        const_phases = jnp.angle(
+            jnp.sum(complex_spectrum * freq_mask[None, :, None], axis=1)
+        )  # shape (Nants, Npol)
 
-        # Back into original 1D shape...
-        phases_unwrapped = np.zeros(phases.shape)
-
-        (Nradial, Nangular, Npol) = phases_unwrapped_2d.shape
-
-        phases_unwrapped[indices.ravel()] = phases_unwrapped_2d.reshape((Nradial * Nangular, Npol))
-
-        return phases_unwrapped
-
-    def sum_corrected_spectrum(self, high_freq, low_freq):
-        complex_phases = np.exp(1.0j * self.phasespectrum_corrected)
-        spectrum_corrected = self.abs_spectrum * complex_phases
-
-        freq_range = np.where((self.freqs > low_freq) & (self.freqs < high_freq))[0]
-        complex_sum = np.sum(spectrum_corrected[:, freq_range, :], axis=1)
-
-        return complex_sum, freq_range
-
-    def degree_of_coherency(self, low_freq=30.0, high_freq=500.0):
-        """
-        Implement Eq. (2.4) in the article, for given frequency band limits.
-
-        Parameters
-        ----------
-        low_freq : float, default=30.0
-        high_freq : float, default=500.0
-        """
-        complex_sum, freq_range = self.sum_corrected_spectrum(high_freq, low_freq)
-
-        abs_sum = np.sum(self.abs_spectrum[:, freq_range, :], axis=1)
-
-        coherency = np.abs(complex_sum) / abs_sum
-
-        return coherency
-
-    def get_constant_phases(self, low_freq=30.0, high_freq=500.0):
-        """
-        Inplement Eq. (2.3) in the article, for given frequency band limits.
-
-        Phases have been corrected to have maximum Hilbert envelope at "t"=0
-        So, add up the complex phases, weighted by the amplitudes, to get the constant phase
-        which determines if the pulse is cos-like or sin-like, or a value in between
-
-        Parameters
-        ----------
-        low_freq : float, default=30.0
-        high_freq : float, default=500.0
-        """
-        complex_sum, freq_range = self.sum_corrected_spectrum(high_freq, low_freq)
-
-        const_phases = np.angle(complex_sum)
-
-        # Do unwrapping in 2D to avoid 2 pi periodicity mismatches (spurious jumps of 2 pi)
-        const_phases_unwrapped = self.phase_unwrap_2d(self.pos_x, self.pos_y, const_phases)
+        const_phases_unwrapped = self.phase_unwrap_2d(
+            self.pos_x, self.pos_y, const_phases
+        )  # shape (Nants, Npol)
 
         return const_phases_unwrapped
-
-    def get_coherency_vs_frequency(self, bandwidth=50.0, low_freq=30.0, high_freq=500.0, coherency_cutoff=0.8):
+    
+    def __call__(
+        self : Self, x : jax.typing.ArrayLike, y: jax.typing.ArrayLike
+    ) -> jax.typing.ArrayLike:
         """
-        Compute `degree of coherency` as from Eq. (2.4) in a sliding frequency window.
+        Compute the interpolated signals at positions (x, y).
 
-        each with bandwidth 50 MHz (or optional value given)
-        Then, see at which frequency this value first drops below 'coherency_cutoff'
-        That frequency defines the 'cutoff frequency' (cutoff_freq) below which
-        the signal is well approximated by a standard impulse, and thus reliably interpolated.
+        Different to the numpy version, this version:
+        - only does linear interpolation
+        - pulse centers the traces
+        - returns all information (traces, timing, absolute spectra, phase spectra)
 
         Parameters
         ----------
-        bandwidth : float, default=50.0
-            frequency bandwidth in MHz
-        low_freq : float, default=30.0
-            low frequency cutoff in MHz
-        high_freq : float, default=500.0
-            high frequency cutoff in MHz
-        coherency_cutoff : float, default=0.8
-            threshold value for coherency level
+        x : jax.typing.ArrayLike
+            x positions to interpolate to
+        y : jax.typing.ArrayLike
+            y positions to interpolate to
         """
-        freq_indices = np.where((self.freqs > low_freq) & (self.freqs < (high_freq)))[0]  # high_freq - bandwidth?
+        xq = jnp.asarray(x)
+        yq = jnp.asarray(y)
 
-        (Nants, Nsamples, Npols) = self.phasespectrum_corrected.shape
-        coherency_vs_freq = np.zeros((Nants, len(freq_indices), Npols))
+        # Evaluate interpolations using jitted module-level wrapper.
+        abs_spectrum_q = _eval_interp2d(self.pos_x, self.pos_y, self.abs_spectrum, xq, yq, False, self.ordered_indices)
+        phase_cos_q = _eval_interp2d(self.pos_x, self.pos_y, self.phase_cos, xq, yq, False, self.ordered_indices)
+        phase_sin_q = _eval_interp2d(self.pos_x, self.pos_y, self.phase_sin, xq, yq, False, self.ordered_indices)
 
-        cutoff_freq = np.zeros((Nants, Npols))
+        phase_spectrum = jnp.angle(phase_cos_q + 1.0j * phase_sin_q)
 
-        for i, freq_index in enumerate(freq_indices):
-            if self.verbose:
-                print('%d / %d' % (i, len(freq_indices)))
-            this_freq = self.freqs[freq_index]
-            coherency = self.degree_of_coherency(low_freq=this_freq, high_freq=this_freq + bandwidth)
-            coherency_vs_freq[:, i, :] = coherency
+        pulse_timings_q = _eval_interp2d(self.pos_x, self.pos_y, self.pulse_timings, xq, yq, True, self.ordered_indices)
+        const_phases_q = _eval_interp2d(self.pos_x, self.pos_y, self.const_phases[:,None,:], xq, yq, False, self.ordered_indices)  # extend dimension to have (Nant, Nfreq, Npol)
 
-        # cutoff_values = np.where(coherency_vs_freq < 0.8)
-        # TODO do this without / with fewer for loops
-        # do explicitly in for loops for now...
-        for ant in range(Nants):
-            for pol in range(Npols):
-                cutoff_index = np.where(coherency_vs_freq[ant, :, pol] < coherency_cutoff)[0]  # first index where < 0.8
-                if len(cutoff_index) > 0:
-                    cutoff_index = cutoff_index[0]
-                else:
-                    cutoff_index = -1
-                cutoff_freq = cutoff_freq.at[ant, pol].set(min(self.freqs[freq_indices[cutoff_index]], high_freq)) # max 500.0 cap, needed?
+        phase_spectrum -= 2 * jnp.pi * (self.freqs[None, :, None] * 1.0e6) * pulse_timings_q[:, None, None]
+        # center the traces too
+        center_pulse_dt = self.sampling_period * (self.trace_length // 2)
+        phase_spectrum -= 2 * jnp.pi * (self.freqs[None, :, None] * 1.0e6) * center_pulse_dt
+        phase_spectrum += const_phases_q
 
-        return (coherency_vs_freq, cutoff_freq)
-    def get_freq_dependent_timing_correction(self, low_freq=30.0, high_freq=500.0,
-                                             bandwidth=50.0, upsample_factor=10,
-                                             ignore_cutoff_freq_in_timing=False):
-        """
-        Implement "method (2)" to account for phase spectra towards higher frequencies.
+        # wrap the phase spectrum
+        phase_spectrum = self.phase_wrap(phase_spectrum)
 
-        Determines arrival time (E-field maximum) in a 50 MHz (or 'bandwidth') sliding frequency window,
-        by filtering to each frequency window and inverse-FFT.
-        Arrival time is mapped to phase in the center of each window.
-
-        Parameters
-        low_freq : float, default=30.0
-            low frequency cutoff in MHz
-        high_freq : float, default=500.0
-            high frequency cutoff in MHz
-        bandwidth : float, default=50.0
-            frequency bandwidth in MHz
-        upsample_factor : int, default=10
-            upsampling factor for timing accuracy
-        ignore_cutoff_freq_in_timing: bool, default=False
-            proceed with pulse timing beyond cutoff frequency
-        """
-        start_freq = self.freqs[self.freqs >= low_freq][0]
-        end_freq = self.freqs[self.freqs <= (high_freq + bandwidth / 2)][-1]
-
-        freq_indices = np.where((self.freqs >= low_freq) & (self.freqs < (high_freq + bandwidth / 2)))[0]
-
-        spectrum_after_correction_so_far = self.abs_spectrum * np.exp(1j * self.phasespectrum_corrected)
-        signals = np.fft.irfft(spectrum_after_correction_so_far, axis=1)
-
-        freq_dependent_timing = np.zeros(self.abs_spectrum.shape)
-
-        for i, freq_index in enumerate(freq_indices):
-            if i % 3 != 0:
-                freq_dependent_timing[:, freq_index, :] += freq_dependent_timing[:, freq_index - 1, :]
-            else:
-                this_freq = self.freqs[freq_index]
-
-                band_low = max(low_freq, this_freq - bandwidth / 2)
-                band_high = min(high_freq + bandwidth, this_freq + bandwidth / 2)
-
-                if ((band_high - band_low) < bandwidth) and (band_low + bandwidth < band_high):
-                    band_high = band_low + bandwidth
-                # check bandwidth
-                if self.verbose:
-                    print('Bandwidth %3.1f MHz, from %3.1f to %3.1f MHz' % (band_high - band_low, band_low, band_high))
-
-                this_timing = self.hilbert_envelope_timing(signals, lowfreq=band_low, highfreq=band_high,
-                                                           upsample_factor=upsample_factor, do_hilbert_envelope=False)
-                # returns timings for (Nant, Npol)
-                freq_dependent_timing[:, freq_index, :] += this_timing  # check index broadcasting
-
-        # do cutoff fixing here
-        # keep timing constant beyond frequency cutoff
-        if not ignore_cutoff_freq_in_timing:
-            (Nants, Nsamples, Npols) = freq_dependent_timing.shape
-            for ant in range(Nants):
-                for pol in range(Npols):
-
-                    # Keep timing values constant for frequencies > local cutoff value
-                    this_index = np.where(self.freqs >= self.cutoff_freq[ant, pol])[0][0]
-                    freq_dependent_timing[ant, this_index:, pol] = freq_dependent_timing[ant, this_index - 1, pol]
-
-                    for i, index in enumerate(freq_indices):
-                        if i == 0:
-                            continue
-                        # Just in case, a similar stopping criterion when successive timings get too `noisy`
-                        if np.abs(freq_dependent_timing[ant, index, pol] - freq_dependent_timing[
-                            ant, index - 1, pol]) > 0.5e-9:
-                            freq_dependent_timing[ant, index:, pol] = freq_dependent_timing[ant, index - 1, pol]
-                            break
-
-        return freq_dependent_timing
-
-    def nearest_antenna_index(self, x, y, same_radius=False, tolerance=1.0):
-        """
-        Search for closest antenna at the same radius, within tolerance (m), when same_radius=True.
-
-        Otherwise find the nearest antenna to (x, y) and return its index
-        The nearest antenna position is then referenced as self.pos_x[index], self.pos_y[index]
-
-        Parameters
-        ----------
-        x : float
-            x position (single value)
-        y : float
-            idem for y
-        same_radius : bool, default=False,
-            consider only antennas at the same radius, +/- 'tolerance'
-        tolerance : float, default=1.0
-            tolerance in m for same_radius search
-        """
-        if not same_radius:
-            index = np.argmin((self.pos_x - x) ** 2 + (self.pos_y - y) ** 2)
-        else:  # a bit convoluted...
-            radius_antennas = np.sqrt(self.pos_x ** 2 + self.pos_y ** 2)
-            thisradius = np.sqrt(x ** 2 + y ** 2)
-
-            indices_same_radius = np.where(
-                (radius_antennas > (thisradius - tolerance)) & (radius_antennas < (thisradius + tolerance))
-            )[0]
-
-            assert len(indices_same_radius) > 0
-            ant_x = self.pos_x[indices_same_radius]
-            ant_y = self.pos_y[indices_same_radius]
-
-            index_min = np.argmin((ant_x - x) ** 2 + (ant_y - y) ** 2)
-
-            index = indices_same_radius[index_min]
-
-        return index
-
-    def get_cutoff_freq(self, x, y, pol):
-        """
-        Get the cutoff frequency in polarization 'pol' interpolated to arbitrary position (x, y).
-
-        Parameters
-        ----------
-        x : float
-            x position (single value)
-        y : float
-            idem for y
-        pol : int
-            polarization number (single value)
-        """
-        return self.interpolators_cutoff_freq[pol](x, y)
-
-    def __init__(self, x, y, signals, signals_start_times=None,
-                 lowfreq=30.0, highfreq=500.0, sampling_period=0.1e-9, phase_method="phasor",
-                 radial_method='cubic', upsample_factor=5, coherency_cutoff_threshold=0.9,
-                 allow_extrapolation=True, ignore_cutoff_freq_in_timing=False, verbose=False):
-
-        self.nofcalls = 0
-        self.verbose = verbose
-        self.method = phase_method
-        self.pos_x = x
-        self.pos_y = y
-        (Nants, Nsamples, Npols) = signals.shape  # hard assumption, 3D...
-        self.trace_length = Nsamples
-        self.sampling_period = sampling_period
-        if self.verbose:
-            print('Setting sampling period to %1.1e seconds' % self.sampling_period)
-
-        # Get the abs-amplitude and phase spectra from the time traces
-        (self.freqs, all_antennas_spectrum, self.abs_spectrum, self.phasespectrum, self.unwrapped_phases) = self.get_spectra(signals)
-
-        if self.verbose:
-            print('Doing timings using hilbert envelope...')
-
-        # Get pulse timings using Hilbert envelope
-        self.pulse_timings = self.hilbert_envelope_timing(signals, lowfreq=30.0, highfreq=80.0,
-                                                          upsample_factor=upsample_factor)
-
-        # Remove timings from phase spectra
-        self.phasespectrum_corrected = self.timing_corrected_phases(self.freqs, self.phasespectrum, self.pulse_timings)
-
-        # Get phase constant or `Hilbert phase`
-        self.const_phases = self.get_constant_phases(high_freq=80.0)
-
-        # Remove phase constant from phase spectra
-        self.phasespectrum_corrected -= self.const_phases[:, np.newaxis, :]  # (Nant, Npol) to (Nant, Nsamples, Npol)
-        self.phasespectrum_corrected_before_freq_dependent = np.copy(
-            self.phasespectrum_corrected
-        )  # for testing / demo purposes
-
-        # Get degree of coherency and reliable high-cutoff frequency
-        if self.verbose:
-            print('Getting coherency and freq cutoff')
-
-        self.coherency_vs_freq, self.cutoff_freq = self.get_coherency_vs_frequency(
-            low_freq=lowfreq,
-            high_freq=highfreq,
-            coherency_cutoff=coherency_cutoff_threshold
-        )
-
-        if self.method == "timing":
-            if verbose:
-                print('Doing freq dependent timing...')
-
-            # Get arrival times in a sliding frequency window
-            self.freq_dependent_timing = self.get_freq_dependent_timing_correction(
-                low_freq=lowfreq, high_freq=highfreq,
-                upsample_factor=upsample_factor,
-                ignore_cutoff_freq_in_timing=ignore_cutoff_freq_in_timing
-            )
-
-            if verbose:
-                print('Done freq dependent timing')
+        # start times
+        if self.start_times is not None:
+            start_times_q = _eval_interp2d(self.pos_x, self.pos_y, self.start_times, xq, yq, True, self.ordered_indices)
         else:
-            self.freq_dependent_timing = np.zeros(self.phasespectrum_corrected.shape)
+            start_times_q = jnp.zeros_like(pulse_timings_q)
+        start_times_q = start_times_q - center_pulse_dt
 
-        # Remove sliding-window timings from phase spectra
-        for i, ant in enumerate(range(Nants)):
-            for pol in range(Npols):
-                this_phase_corrections = 2 * np.pi * (self.freqs * 1.0e6) * self.freq_dependent_timing[ant, :, pol]
-                self.phasespectrum_corrected[ant, :, pol] = self.phasespectrum_corrected[ant, :,
-                                                            pol] + this_phase_corrections  # this can be done more efficiently...
+        # set negative absolute values to zero
+        freq_mask = (self.freqs < self.lowfreq) | (self.freqs > self.highfreq)  # True where we want to zero
+        # reshape for broadcasting: (1, Nfreq, 1)
+        mask_b = freq_mask[None, :, None]
 
-        self.coherency = self.degree_of_coherency(low_freq=lowfreq, high_freq=highfreq)
+        abs_spectrum_q = jnp.where(abs_spectrum_q < 0, 0.0, abs_spectrum_q)
+        abs_spectrum_q = jnp.where(mask_b, 0.0, abs_spectrum_q)
+        phase_spectrum = jnp.where(mask_b, 0.0, phase_spectrum)
 
-        """
-        Produce interpolators for amplitude and phase spectrum
-        Do the Fourier interpolation for each frequency bin < 500 MHz, and for each polarization, separately
-        Note: an order of magnitude speed improvement should be obtainable by vectorizing the Fourier interpolator
-        """
-        nof_freq_channels = len(np.where((self.freqs < highfreq))[0])
+        # reconstruct the time traces
+        spectrum = abs_spectrum_q * jnp.exp(1.0j * phase_spectrum)
+        traces = jnp.fft.irfft(spectrum, n=self.trace_length, axis=1)
 
-        self.interpolators_abs_spectrum = np.empty(
-            (Npols, nof_freq_channels), dtype=object
-        )  # [ [None]*nof_freq_channels ] * Npols
-
-        """
-        Create interpolators for the "phasors" for each frequency,
-        i.e. exp(i phi(f)) = (cos(i phi), sin(i phi)) for each frequency
-        """
-        self.interpolators_cosphi = np.empty((Npols, nof_freq_channels), dtype=object)
-        self.interpolators_sinphi = np.empty((Npols, nof_freq_channels), dtype=object)
-
-        self.interpolators_freq_dependent_timing = np.empty((Npols, nof_freq_channels), dtype=object)
-
-        self.interpolators_timing = np.empty(Npols, dtype=object)
-
-        self.interpolators_constphase = np.empty(Npols, dtype=object)
-
-        self.interpolators_cutoff_freq = np.empty(Npols, dtype=object)
-
-        if verbose:
-            print('Creating %d interpolators total' % (3 * Npols * nof_freq_channels + 3 * Npols), end=' ')
-
-        # Create and initialize the interpolators for all quantities
-        for freq_channel in range(nof_freq_channels):
-            for pol in range(Npols):
-                self.interpolators_abs_spectrum[pol, freq_channel] = interpF.interp2d_fourier(
-                    x, y, self.abs_spectrum[:, freq_channel, pol],
-                    radial_method=radial_method, fill_value='extrapolate' if allow_extrapolation else None
-                )
-                self.interpolators_freq_dependent_timing[pol, freq_channel] = interpF.interp2d_fourier(
-                    x, y, self.freq_dependent_timing[:, freq_channel, pol],
-                    radial_method=radial_method
-                )
-
-                self.interpolators_cosphi[pol, freq_channel] = interpF.interp2d_fourier(
-                    x, y, np.cos(self.phasespectrum_corrected[:, freq_channel, pol]),
-                    radial_method=radial_method
-                )
-                self.interpolators_sinphi[pol, freq_channel] = interpF.interp2d_fourier(
-                    x, y, np.sin(self.phasespectrum_corrected[:, freq_channel, pol]),
-                    radial_method=radial_method
-                )
-
-        for pol in range(Npols):
-            self.interpolators_timing[pol] = interpF.interp2d_fourier(x, y, self.pulse_timings[:, pol])
-            self.interpolators_constphase[pol] = interpF.interp2d_fourier(x, y, self.const_phases[:, pol])
-            self.interpolators_cutoff_freq[pol] = interpF.interp2d_fourier(x, y, self.cutoff_freq[:, pol])
-
-        if signals_start_times is not None:
-            self.interpolators_arrival_times = interpF.interp2d_fourier(x, y, signals_start_times)
-        else:
-            self.interpolators_arrival_times = None
-
-        if self.verbose:
-            print('Done.')
-
-    def __call__(self, x, y,
-                 lowfreq=30.0, highfreq=500.0, filter_up_to_cutoff=False,
-                 account_for_timing=True, pulse_centered=True,
-                 const_time_offset=20.0e-9, full_output=False):
-        """
-        Compute the interpolation at arbitrary position (x, y).
-
-        Parameters
-        ----------
-        x : float
-            the x position in m (single value)
-        y : float
-            idem for y
-        lowfreq : float, default=30.0
-            low-frequency limit in MHz for bandpass filtering of interpolated pulse
-        highfreq : float, default=500.0
-            high-frequency limit in MHz, idem
-        filter_up_to_cutoff : bool, default=False
-            set to True for low-pass filtering up to local estimated cutoff frequency
-        account_for_timing : bool, default=True
-            When True, the pulses are offset from each other according to their natural arrival time.
-            Set to False to have each pulse at a fixed time given by `const_time_offset` instead.
-        pulse_centered : bool, default=True
-            If True, the pulses are shifted to the center of the trace, instead of being close to the trace start
-            as CoREAS simulates them. This is useful to deal with the ringing introduced by filtering the traces.
-        const_time_offset : float, default=20e-9
-            Constant time offset in seconds if not using interpolated arrival times.
-            Note that if used together with `pulse_centered`, this time offset is with respect to the center
-            of the trace.
-        full_output : bool, default=False
-            Put this to True to retrieve arrival time and spectra, next to the signal traces.
-        """
-        if (self.nofcalls == 0) and self.verbose:
-            print('Method: %s' % self.method)
-        self.nofcalls += 1
-
-        Nfreqs = len(self.interpolators_abs_spectrum[0])
-        Npols = len(self.interpolators_abs_spectrum)
-
-        freqs = np.fft.rfftfreq(self.trace_length, d=self.sampling_period)
-        freqs /= 1.0e6  # in MHz
-        # TODO: Make self.freqs
-
-        # Set up reconstructed spectra, timings, phases at freq=0
-        abs_spectrum = np.zeros((self.trace_length // 2 + 1, Npols))
-        phasespectrum = np.zeros((self.trace_length // 2 + 1, Npols))
-        timings = np.zeros(Npols)
-        const_phases = np.zeros(Npols)
-
-        if self.method == 'timing':
-            index_nearest = self.nearest_antenna_index(x, y)
-            print('pos x = %3.2f, y = %3.2f: nearest antenna at x = %3.2f, y = %3.2f m' % (
-                x, y, self.pos_x[index_nearest], self.pos_y[index_nearest])
-            )
-
-            phasespectrum = np.copy(self.phasespectrum_corrected[index_nearest])  # COPY !!!
-            """
-            Do nearest-neighbor interpolation on remaining ('corrected') phases, which should be near zero, 
-            but do full interpolation on amplitude spectrum
-            """
-            for freq_channel in range(Nfreqs):
-                for pol in range(Npols):  # TODO: reduce
-                    thisPower = self.interpolators_abs_spectrum[pol, freq_channel](x, y)
-                    abs_spectrum[freq_channel, pol] = thisPower
-
-            # Account for freq dependent timings, which are interpolated first to (x, y)
-            for freq_channel in range(Nfreqs):
-                for pol in range(Npols):
-                    this_timing = self.interpolators_freq_dependent_timing[pol, freq_channel](x, y)
-                    this_phaseshift = -1.0e6 * self.freqs[freq_channel] * 2 * np.pi * this_timing
-                    phasespectrum[freq_channel, pol] += this_phaseshift
-
-        elif self.method == 'phasor':
-            for freq_channel in range(Nfreqs):
-                for pol in range(Npols):
-                    # Interpolate abs-amplitude spectrum and phasors
-                    thisPower = self.interpolators_abs_spectrum[pol, freq_channel](x, y)
-                    this_realpart = self.interpolators_cosphi[pol, freq_channel](x, y)
-                    this_imagpart = self.interpolators_sinphi[pol, freq_channel](x, y)
-
-                    thisPhase = np.angle(this_realpart + 1.0j * this_imagpart)
-                    # making unit vector by dividing by abs(re**2 + im**2) and multiplying that may be significantly faster
-
-                    abs_spectrum[freq_channel, pol] = thisPower
-                    phasespectrum[freq_channel, pol] = thisPhase
-
-        else:
-            raise ValueError('Unknown reconstruction method: %s' % self.method)
-
-        # Get the start time of the trace from the interpolation
-        trace_start_time = 0
-        if self.interpolators_arrival_times is not None:
-            trace_start_time += self.interpolators_arrival_times(x, y)
-        else:
-            # This should be a logging warning statement
-            print('Trace arrival times were not set during init, only relative timings are returned!')
-        if pulse_centered:
-            # We account for the time shift here, because the later loop is over all polarisations and
-            # then this operation would be applied multiple times
-            time_delta = self.trace_length * 0.5 * self.sampling_period
-            trace_start_time -= time_delta
-        if not account_for_timing:
-            # The interpolated trace start times were from before the timings are taken out from the phase
-            # So it case we do not put them back in, we need to adjust the start times
-            trace_start_time -= const_time_offset
-            print('Relative timing between polarisations is not taken into account!')
-            # TODO: could make trace_start_time array of shape (Npol) and adjust each pol for timings?
-
-        # Apply the 30-80 MHz arrival times and phase constants, each interpolated to (x, y) first
-        for pol in range(Npols):
-            timings[pol] = self.interpolators_timing[pol](x, y)
-            const_phases[pol] = self.interpolators_constphase[pol](x, y)
-            # Account for timing
-            if pulse_centered:
-                # move pulse to the center of the trace
-                time_delta = self.trace_length * 0.5 * self.sampling_period
-                phase_shifts = -1.0e6 * freqs * 2 * np.pi * time_delta
-                phasespectrum[:, pol] += phase_shifts
-            if account_for_timing:
-                phase_shifts = -1.0e6 * freqs * 2 * np.pi * timings[pol]
-                phasespectrum[:, pol] += phase_shifts
-            else:
-                phase_shifts = -1.0e6 * freqs * 2 * np.pi * const_time_offset
-                phasespectrum[:, pol] += phase_shifts
-
-            # Account for constant phase
-            phasespectrum[:, pol] += const_phases[pol]
-
-        # Wrap into (-pi, pi) where needed, to tidy up
-        phasespectrum = self.phase_wrap(phasespectrum)
-        """
-        Set frequency channels with negative abs-amplitude to 0. This can arise sometimes when 
-        Fourier-interpolating abs-amplitudes around a circle. Throw warning when this is needed.
-        """
-        indices_negative = np.where(abs_spectrum < 0)
-        nof_negative = len(indices_negative[0])
-
-        if nof_negative > 0:
-            print('warning: negative values in abs_spectrum found: %d times. Setting to zero.' % nof_negative)
-            abs_spectrum[indices_negative] = 0.0
-        """
-        Filter to bandwidth up to local cutoff frequency if desired, otherwise up to high frequency limit
-        """
-        for pol in range(Npols):
-            high_cutoff = self.interpolators_cutoff_freq[pol](x, y) if filter_up_to_cutoff else highfreq
-
-            filter_indices = np.where((freqs < lowfreq) | (freqs > high_cutoff))
-            abs_spectrum[filter_indices, pol] *= 0.0
-
-        # Produce reconstructed spectrum and time series
-        spectrum = abs_spectrum * np.exp(1.0j * phasespectrum)
-
-        timeseries = np.fft.irfft(spectrum, axis=0)
-
-        if full_output:
-            return timeseries, trace_start_time, abs_spectrum, phasespectrum
-        else:
-            return timeseries
+        return {
+            "traces": traces,
+            "abs_spectrum": abs_spectrum_q,
+            "phase_spectrum": phase_spectrum,
+            "pulse_timings": pulse_timings_q,
+            "start_times": start_times_q,
+        }

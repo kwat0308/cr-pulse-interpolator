@@ -106,7 +106,6 @@ class interp2d_fourier:
         self.angular_FFT = np.fft.rfft(values_ordered, axis=1)
         length = values_ordered.shape[-1]
         self.angular_FFT /= float(length)  # normalize
-        print(self.radial_axis.shape, self.angular_FFT.shape)
 
         # Produce interpolator function, interpolating the FFT components as a function of radius
 
