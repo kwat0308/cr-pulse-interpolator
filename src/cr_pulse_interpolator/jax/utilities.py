@@ -1,30 +1,17 @@
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+import interpax
+from functools import partial
 
-# Core interpolation with boundary handling
-def linear_interp_with_bounds(x, xp, fp):
-    # Find the right index for interpolation
-    idx = jnp.searchsorted(xp, x, side='right') - 1
-    idx = jnp.clip(idx, 0, len(xp) - 2)
+def linear_interp(x, xp, fp):   
+    return interpax.interp1d(xq=x, f=fp, x=xp, method='linear', extrap=True)
 
-    # Interpolation logic
-    x0 = jnp.take(xp, idx)
-    x1 = jnp.take(xp, idx + 1)
-    y0 = jnp.take(fp, idx)
-    y1 = jnp.take(fp, idx + 1)
+def cubic_interp(x, xp, fp):
+    return interpax.interp1d(xq=x, f=fp, x=xp, method='cubic2', extrap=True)
 
-    slope = (y1 - y0) / (x1 - x0)
-    y = y0 + slope * (x - x0)
-
-    # Clamp at boundaries
-    y = jnp.where(x < xp[0], fp[0], y)
-    y = jnp.where(x > xp[-1], fp[-1], y)
-    return y
-
-def linear_interp(x, xp, fp):
-    return jnp.interp(x, xp, fp, left='extrapolate', right='extrapolate')
-
+def cubic_interp_amplitude(x, xp, fp):
+    return interpax.interp1d(xq=x, f=fp, x=xp, method='cubic2', extrap=(fp[0], 0.0))
 
 def batched_fourier_interp_1d(rad, rad_grid, fft_grid):
     """
@@ -51,7 +38,7 @@ def batched_fourier_interp_1d(rad, rad_grid, fft_grid):
     # Function to interpolate over angular arms
     def interp_fn(phi_idx):
         values = fft_grid[:,phi_idx]       # shape: (Ngrid,)
-        return jax.vmap(linear_interp, in_axes=(0, None, None))(rad, rad_grid, values)  # → (Nant,)
+        return jax.vmap(cubic_interp, in_axes=(0, None, None))(rad, rad_grid, values)  # → (Nant,)
 
     # Vectorize over angular arms
     interp_vals = jax.vmap(lambda p: interp_fn(p))(jnp.arange(Nphi))  # shape: (Nrad, Nphi)
@@ -87,7 +74,54 @@ def batched_fourier_signal_interp(rad, rad_grid, fft_grid):
     # Function to interpolate over 1 slice and 1 freq
     def interp_fn(freq_idx, pol_idx, phi_idx):
         values = fft_grid[:,phi_idx, freq_idx, pol_idx]       # shape: (Ngrid,)
-        return jax.vmap(linear_interp, in_axes=(0, None, None))(rad, rad_grid, values)  # → (Nant,)
+        return jax.vmap(cubic_interp, in_axes=(0, None, None))(rad, rad_grid, values)  # → (Nant,)
+
+    # Generate all index combinations
+    phi_idces = jnp.arange(Nphi)
+    freq_idces = jnp.arange(Nfreq)
+    pol_idces = jnp.arange(Npol)
+
+    # Vectorize over frequency and slice
+    interp_vals = jax.vmap(
+        lambda f : jax.vmap(
+            lambda pol : jax.vmap(
+                lambda phi: interp_fn(f,pol,phi)
+            )(phi_idces)
+          )(pol_idces)
+      )(freq_idces)  # shape: (Nrad, Nphi, Nfreq, Npol)
+
+    # Reorder to (Nrad, Nphi, Nfreq, Npol)
+    return jnp.transpose(interp_vals, (3,2,0,1))
+
+def batched_fourier_amplitude_interp(rad, rad_grid, fft_grid):
+    """
+    Batched linear interpolation with boundary handling, specifically for Fourier components.
+
+    For left and right values, the values at the boundaries are used.
+
+    This is different from the 1D case, where only fluence is considered. Here, the batched interpolator is 
+    designed to handle signals, involving different antenna, frequency, and polarizations.
+
+    Parameters
+    ----------
+    rad : jnp.ndarray
+        Input points to interpolate. Shape: (Nrad).
+    xp : jnp.ndarray
+        Points to interpolate at. Shape: (Nrad_grid).
+    fp : jnp.ndarray
+        Function values at xp. Shape: (Nrad_grid, Nphi, Nfreq, Npol).
+
+    Returns
+    -------
+    jnp.ndarray
+        Interpolated values. Shape: (Nrad, Nphi, Nfreq, Npol).
+    """
+    Nrad_grid, Nphi, Nfreq, Npol = fft_grid.shape
+
+    # Function to interpolate over 1 slice and 1 freq
+    def interp_fn(freq_idx, pol_idx, phi_idx):
+        values = fft_grid[:,phi_idx, freq_idx, pol_idx]       # shape: (Ngrid,)
+        return jax.vmap(cubic_interp, in_axes=(0, None, None))(rad, rad_grid, values)  # → (Nant,)
 
     # Generate all index combinations
     phi_idces = jnp.arange(Nphi)

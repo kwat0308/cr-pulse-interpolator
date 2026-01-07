@@ -14,16 +14,17 @@ from jax import tree_util
 from .utilities import (
     batched_fourier_interp_1d,
     batched_fourier_signal_interp,
+    batched_fourier_amplitude_interp,
     batched_fourier_sum,
     batched_fourier_sum_1d,
 )
 
-@partial(jax.jit, static_argnames=("single_axis", "meshgrid"))
+@partial(jax.jit, static_argnames=("interp_type", "meshgrid"))
 def _eval_radial_interpolator(
     rad: jnp.ndarray,
     rad_grid: jnp.ndarray,
     fft_grid: jnp.ndarray,
-    single_axis: bool,
+    interp_type: bool,
     meshgrid: bool,
 ):
     """
@@ -33,10 +34,12 @@ def _eval_radial_interpolator(
     - fft_grid: (R, nphi, ...)  (the angular_FFT arranged per-radius)
     single_axis, meshgrid are static for stable compilation.
     """
-    if single_axis:
+    if interp_type == 'fourier':
         return batched_fourier_interp_1d(rad=rad, rad_grid=rad_grid, fft_grid=fft_grid)
-    else:
+    elif interp_type == 'phase':
         return batched_fourier_signal_interp(rad=rad, rad_grid=rad_grid, fft_grid=fft_grid)
+    elif interp_type == 'amplitude':
+        return batched_fourier_amplitude_interp(rad=rad, rad_grid=rad_grid, fft_grid=fft_grid)
 
 
 class interp2d_fourier:
@@ -53,44 +56,6 @@ class interp2d_fourier:
         the function values (as 1D array) at positions (x, y)
     single_axis : bool, default=True
     """
-
-    # @classmethod
-    # def get_ordering_indices(cls, x, y):
-    #     """
-    #     Produce ordering indices to create (radius, phi) 2D-array from unordered x and y (1D-)arrays.
-
-    #     Parameters
-    #     ----------
-    #     x : np.ndarray
-    #         1D array of x positions
-    #     y : np.ndarray
-    #         1D array of y positions
-    #     """
-    #     radius = jnp.sqrt(x**2 + y**2)
-    #     phi = jnp.arctan2(y, x)  # uses interval -pi..pi
-    #     phi = jnp.around(
-    #         phi, 15
-    #     )  # based on observation that offsets from 0 up to 1e-16 can result from arctan2
-    #     phi = jnp.where(phi<0, phi + 2 * jnp.pi, phi)
-    #     # phi = phi.at[phi < 0].set(
-    #     #     phi[phi < 0] + 2 * jnp.pi
-    #     # )  # put into 0..2pi for ordering.
-    #     phi_sorting = jnp.argsort(phi)
-    #     # Assume star-shaped pattern, i.e. radial # steps = number of (almost) identical phi-values
-    #     # May not work very near (0, 0)
-    #     phi0 = phi[phi_sorting][0]
-
-    #     test = phi[phi_sorting] - phi0
-    #     # radial_steps = len(jnp.where(jnp.abs(test) < 0.0001)[0])
-    #     radial_steps = jnp.sum(jnp.abs(test) < 0.0001)
-    #     phi_steps = len(phi_sorting) // radial_steps
-    #     # phi_sorting = phi_sorting.reshape((phi_steps, radial_steps))
-    #     phi_sorting = jnp.reshape(phi_sorting, (phi_steps, radial_steps))
-    #     indices = jnp.argsort(radius[phi_sorting], axis=1)
-    #     phi_sorting = jnp.take_along_axis(phi_sorting, indices, axis=1)
-    #     ordering_indices = phi_sorting.T  # get shape (radial_steps, phi_steps)
-
-    #     return ordering_indices
 
     @classmethod
     def cos_sin_components(cls, fourier):
@@ -115,7 +80,7 @@ class interp2d_fourier:
         y: jax.typing.ArrayLike,
         values: jax.typing.ArrayLike,
         ordered_indices: jax.Array,
-        single_axis: bool = True,
+        interp_type: str = 'fourier',
         meshgrid: bool = False,
     ) -> None:
         """
@@ -154,14 +119,14 @@ class interp2d_fourier:
         self._phi0 = phi[phi_sorting][0]
 
         # static flags: keep as small python values in aux via tree_flatten
-        self._single_axis_flag = bool(single_axis)
+        self._interp_type_flag = str(interp_type)
         self._meshgrid_flag = bool(meshgrid)
 
     # PyTree protocol: children (leaves) and aux (static metadata)
     def tree_flatten(self) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
         children = (self.radial_axis, self.angular_FFT, self._phi0)
         aux = {
-            "single_axis": self._single_axis_flag,
+            "interp_type": self._interp_type_flag,
             "meshgrid": self._meshgrid_flag,
         }
         return children, aux
@@ -170,7 +135,7 @@ class interp2d_fourier:
     def tree_unflatten(cls, aux: Dict[str, Any], children: Tuple[Any, ...]) -> "interp2d_fourier":
         obj = cls.__new__(cls)
         obj.radial_axis, obj.angular_FFT, obj._phi0 = children
-        obj._single_axis_flag = bool(aux["single_axis"])
+        obj._interp_type_flag = bool(aux["interp_type"])
         obj._meshgrid_flag = bool(aux["meshgrid"])
         return obj
 
@@ -198,7 +163,7 @@ class interp2d_fourier:
 
         # Interpolate Fourier components over all values of radius
         # Evaluate radial interpolator with the module-level jitted wrapper
-        fourier = _eval_radial_interpolator(rad_q, self.radial_axis, self.angular_FFT, self._single_axis_flag, self._meshgrid_flag)
+        fourier = _eval_radial_interpolator(rad_q, self.radial_axis, self.angular_FFT, self._interp_type_flag, self._meshgrid_flag)
         # decide which axis contains Fourier components depending on meshgrid
         fourier_comp_axis = 2 if self._meshgrid_flag else 1
         fourier_len = fourier.shape[fourier_comp_axis]
@@ -208,7 +173,7 @@ class interp2d_fourier:
 
         # determine Fourier mode multipliers
         limit = (max_fourier_mode + 1) if (max_fourier_mode is not None) else fourier_len
-        mult = jnp.arange(limit, dtype=int)
+        mult = jnp.linspace(0, limit-1, limit, dtype=int)
         phi_k = phi_q[..., jnp.newaxis] * mult  # shape (..., limit)
 
         # choose correct summation helper

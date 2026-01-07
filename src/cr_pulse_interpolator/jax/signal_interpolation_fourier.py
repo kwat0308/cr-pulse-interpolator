@@ -23,18 +23,33 @@ from .interpolation_fourier import interp2d_fourier
 # The `single_axis` parameter is static for performance; change if you need dynamic behavior.
 # --------
 
-@partial(jax.jit, static_argnames=("single_axis",))
-def _eval_interp2d(pos_x: jnp.ndarray, pos_y: jnp.ndarray, data: jnp.ndarray,
-                   xq: jnp.ndarray, yq: jnp.ndarray, single_axis: bool, ordered_indices : jnp.ndarray) -> jnp.ndarray:
+
+@partial(jax.jit, static_argnames=("interp_type",))
+def _eval_interp2d(
+    pos_x: jnp.ndarray,
+    pos_y: jnp.ndarray,
+    data: jnp.ndarray,
+    xq: jnp.ndarray,
+    yq: jnp.ndarray,
+    interp_type: str,
+    ordered_indices: jnp.ndarray,
+) -> jnp.ndarray:
     """
     Build a temporary interp2d_fourier interpolator and evaluate it.
     - pos_x, pos_y: shape (Nants,)
-    - data: shape (Nants, ... ) depending on single_axis
+    - data: shape (Nants, ... ) depending on interp_type
     - xq, yq: query points, shape (M,)
     Returns evaluator output.
     """
-    interp = interp2d_fourier(x=pos_x, y=pos_y, values=data, single_axis=single_axis, ordered_indices=ordered_indices)
+    interp = interp2d_fourier(
+        x=pos_x,
+        y=pos_y,
+        values=data,
+        interp_type=interp_type,
+        ordered_indices=ordered_indices,
+    )
     return interp(xq, yq)
+
 
 @tree_util.register_pytree_node_class
 class interp2d_signal:
@@ -76,19 +91,71 @@ class interp2d_signal:
 
     def __init__(
         self: Self,
-        x: jax.typing.ArrayLike,
-        y: jax.typing.ArrayLike,
-        signals: jax.typing.ArrayLike,
-        signals_start_times : Optional[jax.typing.ArrayLike] = None,
+        signal_shape : tuple,
+        ordered_indices: jax.typing.ArrayLike,
         sampling_period: float = 1.0e-10,  # in seconds
-        lowfreq : float = 30.0,  # in MHz
-        highfreq : float = 500.0,  # in MHz
+        lowfreq: float = 30.0,  # in MHz
+        highfreq: float = 500.0,  # in MHz
         lowfreq_phase: float = 30.0,  # in MHz
         highfreq_phase: float = 80.0,  # in MHz,
         upsample_factor: int = 5,
     ) -> None:
         """
         Initialize all the interpolators that will be used for signal interpolation.
+
+        This basically initializes the object with the necessary parameters,
+        but doesnt actually do any computation. The computation is delegated to the `initialize` method, since we want to JIT compile that part.
+
+        Parameters
+        ----------
+        signal_shape : tuple
+            shape of the input signals, (Nants, Nsamples, Npol)
+            NOTE: MUST BE in this shape!
+        ordered_indices : jax.typing.ArrayLike
+            precomputed ordering indices for the antenna positions.
+
+            Note: this is assumed to be the same for any position set given in initialize. This may not be true in general, but is a reasonable assumption for now.
+
+            In particular, such an assumption is required since JAX requires static arguments for JIT compilation.
+        sampling_period : float, default=0.1 ns
+            time step between samples in seconds
+        lowfreq : float, default=30 MHz
+            low frequency cut for Fourier components, in MHz
+        highfreq : float, default=500 MHz
+            high frequency cut for Fourier components, in MHz
+        lowfreq_phase : float, default=30 MHz
+            low frequency cut for calculation of the phase corrections & Hilbert envelope, in MHz
+        highfreq_phase : float, default=80 MHz
+            high frequency cut for calculation of the phase corrections & Hilbert envelope, in MHz
+        upsample_factor : int, default=5
+            factor by which to upsample time traces for pulse timing search
+        """
+        (Nants, Nsamples, Npols) = signal_shape  # hard assumption, 3D...
+        self.trace_length = Nsamples
+        self.sampling_period = sampling_period
+        self.lowfreq = lowfreq
+        self.highfreq = highfreq
+        self.lowfreq_phase = lowfreq_phase
+        self.highfreq_phase = highfreq_phase
+        self.upsample_factor = upsample_factor
+
+        self.ordered_indices = ordered_indices  # store the ordering indices in shape (Nphi, Nrad)
+
+        # store the other shapes too
+        self.Nants = Nants
+        self.Npols = Npols
+
+    def initialize(
+        self: Self,
+        x: jax.typing.ArrayLike,
+        y: jax.typing.ArrayLike,
+        signals: jax.typing.ArrayLike,
+        signal_start_times: Optional[jax.typing.ArrayLike] = None,
+    ) -> None:
+        """
+        Initialize the interpolator.
+
+        This is separated from __init__ to allow for JIT compilation of the initialization step.
 
         This includes to compute the following:
         - FFT spectra of the input signals
@@ -112,76 +179,59 @@ class interp2d_signal:
             the time traces at positions (x, y), shape (Nants, Nsamples, Npol)
         signals_start_times : jax.typing.ArrayLike or None
             the start times of the input signals at positions (x, y), shape (Nants, ), in seconds. If None, assumed to be zero for all antennas.
-        sampling_period : float, default=0.1 ns
-            time step between samples in seconds
-        lowfreq : float, default=30 MHz
-            low frequency cut for Fourier components, in MHz
-        highfreq : float, default=500 MHz
-            high frequency cut for Fourier components, in MHz
-        lowfreq_phase : float, default=30 MHz
-            low frequency cut for calculation of the phase corrections & Hilbert envelope, in MHz
-        highfreq_phase : float, default=80 MHz
-            high frequency cut for calculation of the phase corrections & Hilbert envelope, in MHz
-        upsample_factor : int, default=5
-            factor by which to upsample time traces for pulse timing search
         """
         self.pos_x = jnp.asarray(x)
         self.pos_y = jnp.asarray(y)
-        (Nants, Nsamples, Npols) = signals.shape  # hard assumption, 3D...
-        self.trace_length = Nsamples
-        self.sampling_period = sampling_period
-        self.lowfreq = lowfreq  
-        self.highfreq = highfreq
-
-        self.ordered_indices = shower_utils.get_ordering_indices(
-            self.pos_x, self.pos_y
-        )  # shape (Nrad, Nphi)
-
-        # store the other shapes too
-        self.Nants = Nants
-        self.Npols = Npols
 
         # first obtain the frequency spectra
         freqs, _, abs_spectrum, phase_spectrum, _ = self.get_spectra(
             signals
         )  # shapes ((Nfreq,), (Nants, Nfreq, Npol), ...)
 
-        self.freqs = freqs # store frequency grid
+        self.freqs = freqs  # store frequency grid
 
         # get the pulse timings
         pulse_timings = self.get_pulse_timings(
             signals,
-            lowfreq=lowfreq_phase,
-            highfreq=highfreq_phase,
-            upsample_factor=upsample_factor,
+            lowfreq=self.lowfreq_phase,
+            highfreq=self.highfreq_phase,
+            upsample_factor=self.upsample_factor,
         )  # shape (Nants, )
 
         phase_spectra_corrected = self.get_timing_corrected_phases(
             freqs, phase_spectrum, pulse_timings
         )  # shape (Nants, Nfreq, Npol)
 
-        # get constant phases 
+        # get constant phases
         const_phases_unwrapped = self.get_constant_phases(
             abs_spectrum,
             phase_spectra_corrected,
-            lowfreq=lowfreq_phase,
-            highfreq=highfreq_phase,
+            lowfreq=self.lowfreq_phase,
+            highfreq=self.highfreq_phase,
         )  # shape (Nants, Npol)
 
+        self.phase_spectrum_uncorrected = phase_spectrum  # (Nants, Nfreq, Npol)
+
         # now we calculated the corrected phase spectra, subtracted by the constant phase
-        phase_spectra_corrected = phase_spectra_corrected - const_phases_unwrapped[:, None, :]
+        phase_spectra_corrected = (
+            phase_spectra_corrected - const_phases_unwrapped[:, None, :]
+        )
 
         # store the minimal arrays required to reconstruct signals later
         # store cos/sin of corrected phases to keep interpolation of phase stable
-        self.abs_spectrum = jnp.asarray(abs_spectrum)  # (Nants, Nfreq, Npol)
+        eps = 1e-20  # some small number
+        self.abs_spectrum = jnp.maximum(
+            jnp.asarray(abs_spectrum), eps
+        )  # (Nants, Nfreq, Npol)
         self.phase_cos = jnp.cos(phase_spectra_corrected)
         self.phase_sin = jnp.sin(phase_spectra_corrected)
+        self.phase_spectrum = phase_spectra_corrected  # (Nants, Nfreq, Npol)
 
         self.pulse_timings = jnp.asarray(pulse_timings)  # (Nants,)
         self.const_phases = jnp.asarray(const_phases_unwrapped)  # (Nants, Npol)
 
-        if signals_start_times is not None:
-            self.start_times = jnp.asarray(signals_start_times)
+        if signal_start_times is not None:
+            self.start_times = jnp.asarray(signal_start_times)
         else:
             self.start_times = None
 
@@ -197,10 +247,12 @@ class interp2d_signal:
             self.abs_spectrum,
             self.phase_cos,
             self.phase_sin,
+            self.phase_spectrum,
+            self.phase_spectrum_uncorrected,
             self.pulse_timings,
             self.const_phases,
             self.start_times,
-            self.ordered_indices
+            self.ordered_indices,
         )
 
         # Aux (static small metadata)
@@ -215,7 +267,9 @@ class interp2d_signal:
         return children, aux
 
     @classmethod
-    def tree_unflatten(cls, aux: Dict[str, Any], children: Tuple[Any, ...]) -> "interp2d_signal":
+    def tree_unflatten(
+        cls, aux: Dict[str, Any], children: Tuple[Any, ...]
+    ) -> "interp2d_signal":
         # reconstruct object without running __init__
         obj = cls.__new__(cls)
         (
@@ -225,10 +279,12 @@ class interp2d_signal:
             obj.abs_spectrum,
             obj.phase_cos,
             obj.phase_sin,
+            obj.phase_spectrum,
+            obj.phase_spectrum_uncorrected,
             obj.pulse_timings,
             obj.const_phases,
             obj.start_times,
-            obj.ordered_indices
+            obj.ordered_indices,
         ) = children
 
         # restore aux
@@ -260,7 +316,7 @@ class interp2d_signal:
 
     @staticmethod
     def phase_unwrap_2d(
-        x: jax.typing.ArrayLike, y: jax.typing.ArrayLike, phases: jax.typing.ArrayLike
+        ordered_indices : jax.typing.ArrayLike, phases: jax.typing.ArrayLike
     ) -> jax.typing.ArrayLike:
         """
         Unwrap the phases in 2D.
@@ -269,10 +325,8 @@ class interp2d_signal:
 
         Parameters
         ----------
-        x : jax.typing.ArrayLike
-            x positions of antennas
-        y : jax.typing.ArrayLike
-            y positions of antennas
+        ordered_indices : jax.typing.ArrayLike
+            ordering indices to reshape phases into 2D (Nradial, Nangular)
         phases : jax.typing.ArrayLike
             phases to unwrap, shape (Nants, Npol)
 
@@ -281,8 +335,8 @@ class interp2d_signal:
         jax.typing.ArrayLike
             unwrapped phases, shape (Nants, Npol)
         """
-        indices = shower_utils.get_ordering_indices(x, y)
-        ordered_phases = phases[indices]
+        # indices = shower_utils.get_ordering_indices(x, y)
+        ordered_phases = phases[ordered_indices]
 
         # First along radial axis, then angular axis
         phases_unwrapped_2d = jnp.unwrap(ordered_phases, axis=0)
@@ -293,7 +347,7 @@ class interp2d_signal:
 
         (Nradial, Nangular, Npol) = phases_unwrapped_2d.shape
 
-        phases_unwrapped = phases_unwrapped.at[indices.ravel()].set(
+        phases_unwrapped = phases_unwrapped.at[ordered_indices.ravel()].set(
             phases_unwrapped_2d.reshape((Nradial * Nangular, Npol))
         )
 
@@ -431,9 +485,7 @@ class interp2d_signal:
         # finding the indicies of the pulse maximum for each antenna position
         arrival_times = (
             jnp.argmax(hilbert_sum, axis=-1) - shifted_traces.shape[2] // 2
-        ) * (
-            self.sampling_period / upsample_factor
-        )  # shape (Nants,)
+        ) * (self.sampling_period / upsample_factor)  # shape (Nants,)
 
         return arrival_times
 
@@ -513,13 +565,13 @@ class interp2d_signal:
         )  # shape (Nants, Npol)
 
         const_phases_unwrapped = self.phase_unwrap_2d(
-            self.pos_x, self.pos_y, const_phases
+            self.ordered_indices, const_phases
         )  # shape (Nants, Npol)
 
         return const_phases_unwrapped
-    
+
     def __call__(
-        self : Self, x : jax.typing.ArrayLike, y: jax.typing.ArrayLike
+        self: Self, x: jax.typing.ArrayLike, y: jax.typing.ArrayLike
     ) -> jax.typing.ArrayLike:
         """
         Compute the interpolated signals at positions (x, y).
@@ -540,19 +592,66 @@ class interp2d_signal:
         yq = jnp.asarray(y)
 
         # Evaluate interpolations using jitted module-level wrapper.
-        abs_spectrum_q = _eval_interp2d(self.pos_x, self.pos_y, self.abs_spectrum, xq, yq, False, self.ordered_indices)
-        phase_cos_q = _eval_interp2d(self.pos_x, self.pos_y, self.phase_cos, xq, yq, False, self.ordered_indices)
-        phase_sin_q = _eval_interp2d(self.pos_x, self.pos_y, self.phase_sin, xq, yq, False, self.ordered_indices)
+        abs_spectrum_q = _eval_interp2d(
+            self.pos_x,
+            self.pos_y,
+            self.abs_spectrum,
+            xq,
+            yq,
+            "amplitude",
+            self.ordered_indices,
+        )
+        phase_cos_q = _eval_interp2d(
+            self.pos_x,
+            self.pos_y,
+            self.phase_cos,
+            xq,
+            yq,
+            "phase",
+            self.ordered_indices,
+        )
+        phase_sin_q = _eval_interp2d(
+            self.pos_x,
+            self.pos_y,
+            self.phase_sin,
+            xq,
+            yq,
+            "phase",
+            self.ordered_indices,
+        )
 
         phase_spectrum = jnp.angle(phase_cos_q + 1.0j * phase_sin_q)
 
-        pulse_timings_q = _eval_interp2d(self.pos_x, self.pos_y, self.pulse_timings, xq, yq, True, self.ordered_indices)
-        const_phases_q = _eval_interp2d(self.pos_x, self.pos_y, self.const_phases[:,None,:], xq, yq, False, self.ordered_indices)  # extend dimension to have (Nant, Nfreq, Npol)
+        pulse_timings_q = _eval_interp2d(
+            self.pos_x,
+            self.pos_y,
+            self.pulse_timings,
+            xq,
+            yq,
+            "fourier",
+            self.ordered_indices,
+        )
+        const_phases_q = _eval_interp2d(
+            self.pos_x,
+            self.pos_y,
+            self.const_phases[:, None, :],
+            xq,
+            yq,
+            "phase",
+            self.ordered_indices,
+        )  # extend dimension to have (Nant, Nfreq, Npol)
 
-        phase_spectrum -= 2 * jnp.pi * (self.freqs[None, :, None] * 1.0e6) * pulse_timings_q[:, None, None]
+        phase_spectrum -= (
+            2
+            * jnp.pi
+            * (self.freqs[None, :, None] * 1.0e6)
+            * pulse_timings_q[:, None, None]
+        )
         # center the traces too
         center_pulse_dt = self.sampling_period * (self.trace_length // 2)
-        phase_spectrum -= 2 * jnp.pi * (self.freqs[None, :, None] * 1.0e6) * center_pulse_dt
+        phase_spectrum -= (
+            2 * jnp.pi * (self.freqs[None, :, None] * 1.0e6) * center_pulse_dt
+        )
         phase_spectrum += const_phases_q
 
         # wrap the phase spectrum
@@ -560,19 +659,29 @@ class interp2d_signal:
 
         # start times
         if self.start_times is not None:
-            start_times_q = _eval_interp2d(self.pos_x, self.pos_y, self.start_times, xq, yq, True, self.ordered_indices)
+            start_times_q = _eval_interp2d(
+                self.pos_x,
+                self.pos_y,
+                self.start_times,
+                xq,
+                yq,
+                "fourier",
+                self.ordered_indices,
+            )
         else:
             start_times_q = jnp.zeros_like(pulse_timings_q)
         start_times_q = start_times_q - center_pulse_dt
 
         # set negative absolute values to zero
-        freq_mask = (self.freqs < self.lowfreq) | (self.freqs > self.highfreq)  # True where we want to zero
+        freq_mask = (self.freqs < self.lowfreq) | (
+            self.freqs > self.highfreq
+        )  # True where we want to zero
         # reshape for broadcasting: (1, Nfreq, 1)
         mask_b = freq_mask[None, :, None]
 
-        abs_spectrum_q = jnp.where(abs_spectrum_q < 0, 0.0, abs_spectrum_q)
+        abs_spectrum_q = jnp.where(abs_spectrum_q < 1e-20, 1e-20, abs_spectrum_q)
         abs_spectrum_q = jnp.where(mask_b, 0.0, abs_spectrum_q)
-        phase_spectrum = jnp.where(mask_b, 0.0, phase_spectrum)
+        # phase_spectrum = jnp.where(mask_b, 0.0, phase_spectrum)
 
         # reconstruct the time traces
         spectrum = abs_spectrum_q * jnp.exp(1.0j * phase_spectrum)
