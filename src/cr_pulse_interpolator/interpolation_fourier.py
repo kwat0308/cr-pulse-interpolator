@@ -64,21 +64,44 @@ class interp2d_fourier:
         return ordering_indices
 
     @classmethod
-    def cos_sin_components(cls, fourier):
+    def cos_sin_components(cls, fourier, n_value_dims=0):
         """
         Convert complex FFT as from np.fft.rfft to real-valued cos, sin components
-
-        Parameters
-        -----------
-        fourier : np.ndarray
-            complex Fourier components, with Fourier series running along the last axis.
         """
+
+        fourier_axis = -1 - n_value_dims
+
         cos_components = 2 * np.real(fourier)
-        cos_components[..., 0] *= 0.5
-        cos_components[..., -1] *= 0.5
         sin_components = -2 * np.imag(fourier)
 
+        # Index helpers
+        idx0 = [slice(None)] * cos_components.ndim
+        idxN = [slice(None)] * cos_components.ndim
+
+        idx0[fourier_axis] = 0
+        idxN[fourier_axis] = -1
+
+        cos_components[tuple(idx0)] *= 0.5
+        cos_components[tuple(idxN)] *= 0.5
+
         return cos_components, sin_components
+
+
+    # def cos_sin_components(cls, fourier):
+    #     """
+    #     Convert complex FFT as from np.fft.rfft to real-valued cos, sin components
+
+    #     Parameters
+    #     -----------
+    #     fourier : np.ndarray
+    #         complex Fourier components, with Fourier series running along the last axis.
+    #     """
+    #     cos_components = 2 * np.real(fourier)
+    #     cos_components[..., 0] *= 0.5
+    #     cos_components[..., -1] *= 0.5
+    #     sin_components = -2 * np.imag(fourier)
+
+    #     return cos_components, sin_components
 
     def __init__(self, x, y, values, radial_method='cubic', fill_value='extrapolate', recover_concentric_rings=False):
         # Convert (x, y) to (r, phi), make 2d position array, sorting positions and values by r and phi
@@ -103,12 +126,16 @@ class interp2d_fourier:
                     values_ordered_interpolated.append(intpf(self.radial_axis))
                 values_ordered = np.array(values_ordered_interpolated).T
 
+        self._value_shape = values_ordered.shape[2:] if values_ordered.ndim > 2 else ()
+        self._n_value_dims = len(self._value_shape)
+
         # FFT over the angular direction, for each radius
         self.angular_FFT = np.fft.rfft(values_ordered, axis=1)
-        length = values_ordered.shape[-1]
+        length = values_ordered.shape[1]
         self.angular_FFT /= float(length)  # normalize
-
+        #import pdb; pdb.set_trace()
         # Produce interpolator function, interpolating the FFT components as a function of radius
+        #import pdb; pdb.set_trace()
 
         if fill_value is None:
             fill_value = (self.angular_FFT[0], np.zeros_like(self.angular_FFT[0]))
@@ -116,6 +143,8 @@ class interp2d_fourier:
             self.radial_axis, self.angular_FFT, axis=0, kind=radial_method, fill_value=fill_value, bounds_error=False
         )  # Interpolates the Fourier components along the radial axis
 
+        import pdb; pdb.set_trace()
+    
     def __call__(self, x, y, max_fourier_mode=None):
         """
         Interpolate the input used in __init__ for input positions (x, y)
@@ -135,22 +164,50 @@ class interp2d_fourier:
 
         # Interpolate Fourier components over all values of radius
         fourier = self.interpolator_radius(radius)
-        fourier_len = fourier.shape[-1]
+        #fourier_len = fourier.shape[-1]
 
-        (cos_components, sin_components) = interp2d_fourier.cos_sin_components(fourier)
+        fourier_axis = -1 - self._n_value_dims
+        fourier_len = fourier.shape[fourier_axis]
+        print('boe')
+        print(fourier_len)
+        #import pdb; pdb.set_trace()
 
+        (cos_components, sin_components) = interp2d_fourier.cos_sin_components(fourier, self._n_value_dims)
+        print('bioe2')
         # Multipliers for Fourier modes, as k in cos(k*phi), sin(k*phi)
         limit = max_fourier_mode + 1 if max_fourier_mode is not None else fourier_len
         mult = np.linspace(0, limit - 1, limit).astype(int)
 
+        fourier_axis = -1 - self._n_value_dims 
+
+        angle = phi[..., None] * mult
+        angle = angle[(...,) + (None,) * self._n_value_dims]
+
+        result = np.sum(
+            cos_components[..., :limit] * np.cos(angle)
+            + sin_components[..., :limit] * np.sin(angle),
+            axis=fourier_axis
+        )
+
+
+        # angle = phi[..., None] * mult
+        # angle = angle[(...,) + (None,) * self._n_value_dims]
+        # print(angle) 
+        # result = np.sum(
+        #     cos_components[..., :limit, :] * np.cos(angle)
+        #     + sin_components[..., :limit, :] * np.sin(angle),
+        #     axis=1)
+
+
+
         # The Fourier sum done explicitly, as sum_k( c_k cos(k phi) + s_k sin(k phi) )
-        result = np.zeros_like(radius)
-        if isinstance(phi, float):
-            result += np.sum(cos_components[..., 0:limit] * np.cos(phi * mult))
-            result += np.sum(sin_components[..., 0:limit] * np.sin(phi * mult))
-        else:
-            result += np.sum(cos_components[..., 0:limit] * np.cos(phi[..., np.newaxis] * mult), axis=-1)
-            result += np.sum(sin_components[..., 0:limit] * np.sin(phi[..., np.newaxis] * mult), axis=-1)
+        # result = np.zeros_like(radius)
+        # if isinstance(phi, float):
+        #     result += np.sum(cos_components[..., 0:limit] * np.cos(phi * mult))
+        #     result += np.sum(sin_components[..., 0:limit] * np.sin(phi * mult))
+        # else:
+        #     result += np.sum(cos_components[..., 0:limit] * np.cos(phi[..., np.newaxis] * mult), axis=-1)
+        #     result += np.sum(sin_components[..., 0:limit] * np.sin(phi[..., np.newaxis] * mult), axis=-1)
 
         return result
 
