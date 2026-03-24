@@ -143,7 +143,7 @@ class interp2d_fourier:
             self.radial_axis, self.angular_FFT, axis=0, kind=radial_method, fill_value=fill_value, bounds_error=False
         )  # Interpolates the Fourier components along the radial axis
 
-        import pdb; pdb.set_trace()
+        #import pdb; pdb.set_trace()
     
     def __call__(self, x, y, max_fourier_mode=None):
         """
