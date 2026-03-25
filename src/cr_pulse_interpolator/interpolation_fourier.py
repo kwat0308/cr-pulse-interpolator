@@ -75,14 +75,14 @@ class interp2d_fourier:
         sin_components = -2 * np.imag(fourier)
 
         # Index helpers
-        idx0 = [slice(None)] * cos_components.ndim
-        idxN = [slice(None)] * cos_components.ndim
+        index0 = [slice(None)] * cos_components.ndim
+        indexN = [slice(None)] * cos_components.ndim
 
-        idx0[fourier_axis] = 0
-        idxN[fourier_axis] = -1
+        index0[fourier_axis] = 0
+        indexN[fourier_axis] = -1
 
-        cos_components[tuple(idx0)] *= 0.5
-        cos_components[tuple(idxN)] *= 0.5
+        cos_components[tuple(index0)] *= 0.5
+        cos_components[tuple(indexN)] *= 0.5
 
         return cos_components, sin_components
 
@@ -168,12 +168,9 @@ class interp2d_fourier:
 
         fourier_axis = -1 - self._n_value_dims
         fourier_len = fourier.shape[fourier_axis]
-        print('boe')
-        print(fourier_len)
-        #import pdb; pdb.set_trace()
-
+        
         (cos_components, sin_components) = interp2d_fourier.cos_sin_components(fourier, self._n_value_dims)
-        print('bioe2')
+        
         # Multipliers for Fourier modes, as k in cos(k*phi), sin(k*phi)
         limit = max_fourier_mode + 1 if max_fourier_mode is not None else fourier_len
         mult = np.linspace(0, limit - 1, limit).astype(int)
@@ -184,8 +181,8 @@ class interp2d_fourier:
         angle = angle[(...,) + (None,) * self._n_value_dims]
 
         result = np.sum(
-            cos_components[..., :limit] * np.cos(angle)
-            + sin_components[..., :limit] * np.sin(angle),
+            cos_components[..., 0:limit] * np.cos(angle)
+            + sin_components[..., 0:limit] * np.sin(angle),
             axis=fourier_axis
         )
 

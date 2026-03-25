@@ -462,6 +462,7 @@ class interp2d_signal:
                  radial_method='cubic', upsample_factor=5, coherency_cutoff_threshold=0.9,
                  allow_extrapolation=True, ignore_cutoff_freq_in_timing=False, verbose=False):
 
+        print('Running OLD version of signal_interpolation_fourier')
         self.nofcalls = 0
         self.verbose = verbose
         self.method = phase_method
@@ -731,7 +732,7 @@ class interp2d_signal:
         nof_negative = len(indices_negative[0])
 
         if nof_negative > 0:
-            print('warning: negative values in abs_spectrum found: %d times. Setting to zero.' % nof_negative)
+            #print('warning: negative values in abs_spectrum found: %d times. Setting to zero.' % nof_negative)
             abs_spectrum[indices_negative] = 0.0
         """
         Filter to bandwidth up to local cutoff frequency if desired, otherwise up to high frequency limit
