@@ -798,8 +798,8 @@ class interp2d_signal:
         indices_negative = np.where(abs_spectrum < 0)
         nof_negative = len(indices_negative[0])
 
-        if nof_negative > 0:
-            #print('warning: negative values in abs_spectrum found: %d times. Setting to zero.' % nof_negative)
+        if nof_negative > 50:
+            print('warning: negative values in abs_spectrum found: %d times. Setting to zero.' % nof_negative)
             abs_spectrum[indices_negative] = 0.0
         """
         Filter to bandwidth up to local cutoff frequency if desired, otherwise up to high frequency limit

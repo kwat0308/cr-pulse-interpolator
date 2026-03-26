@@ -117,7 +117,7 @@ class interp2d_fourier:
             if not recover_concentric_rings:
                 raise ValueError("Radius must be (approx.) constant along angular direction. "
                                  "You can try to \"fix\" that by using \"recover_concentric_rings=True\"")
-            else:
+            else: # TODO refactor to allow vectorized inputs with recover_concentric_rings==True !
                 self.radial_axis = np.mean(radius[ordering_indices], axis=1)
                 values_ordered_interpolated = []
                 for x, y in zip(radius[ordering_indices].T, values_ordered.T):
@@ -133,9 +133,7 @@ class interp2d_fourier:
         self.angular_FFT = np.fft.rfft(values_ordered, axis=1)
         length = values_ordered.shape[1]
         self.angular_FFT /= float(length)  # normalize
-        #import pdb; pdb.set_trace()
         # Produce interpolator function, interpolating the FFT components as a function of radius
-        #import pdb; pdb.set_trace()
 
         if fill_value is None:
             fill_value = (self.angular_FFT[0], np.zeros_like(self.angular_FFT[0]))
@@ -143,8 +141,8 @@ class interp2d_fourier:
             self.radial_axis, self.angular_FFT, axis=0, kind=radial_method, fill_value=fill_value, bounds_error=False
         )  # Interpolates the Fourier components along the radial axis
 
-        #import pdb; pdb.set_trace()
-    
+        return 
+
     def __call__(self, x, y, max_fourier_mode=None):
         """
         Interpolate the input used in __init__ for input positions (x, y)
