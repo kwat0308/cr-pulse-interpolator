@@ -117,14 +117,20 @@ class interp2d_fourier:
             if not recover_concentric_rings:
                 raise ValueError("Radius must be (approx.) constant along angular direction. "
                                  "You can try to \"fix\" that by using \"recover_concentric_rings=True\"")
-            else: # TODO refactor to allow vectorized inputs with recover_concentric_rings==True !
+            else: # TODO check behavior of recover_concentric_rings==True
                 self.radial_axis = np.mean(radius[ordering_indices], axis=1)
                 values_ordered_interpolated = []
-                for x, y in zip(radius[ordering_indices].T, values_ordered.T):
-                    intpf = intp.interp1d(
-                        x, y, axis=0, kind=radial_method, fill_value='extrapolate')
+                for radius_slice, values_slice in zip(np.moveaxis(radius[ordering_indices], 0, 1), np.moveaxis(values_ordered, 0, 1)):
+                    intpf = intp.interp1d(radius_slice, values_slice, axis=0, kind=radial_method, fill_value='extrapolate')
+
                     values_ordered_interpolated.append(intpf(self.radial_axis))
-                values_ordered = np.array(values_ordered_interpolated).T
+
+                    values_ordered = np.stack(values_ordered_interpolated, axis=1)
+                # for x, y in zip(radius[ordering_indices].T, values_ordered.T):
+                #     intpf = intp.interp1d(
+                #         x, y, axis=0, kind=radial_method, fill_value='extrapolate')
+                #     values_ordered_interpolated.append(intpf(self.radial_axis))
+                # values_ordered = np.array(values_ordered_interpolated).T
 
         self._value_shape = values_ordered.shape[2:] if values_ordered.ndim > 2 else ()
         self._n_value_dims = len(self._value_shape)
