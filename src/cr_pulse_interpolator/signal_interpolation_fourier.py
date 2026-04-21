@@ -540,10 +540,6 @@ class interp2d_signal:
         self.Nfreqs = nof_freq_channels
         self.Nfreqs_full = len(self.freqs)
 
-        #self.interpolators_abs_spectrum = np.empty(
-        #    (Npols, nof_freq_channels), dtype=object
-        #)  # [ [None]*nof_freq_channels ] * Npols
-
         self.interpolator_abs_spectrum = interpF.interp2d_fourier(
                     x, y, self.abs_spectrum[:, 0:nof_freq_channels, :],
                     radial_method=radial_method, fill_value='extrapolate' if allow_extrapolation else None
@@ -569,51 +565,15 @@ class interp2d_signal:
         Create interpolators for the "phasors" for each frequency,
         i.e. exp(i phi(f)) = (cos(i phi), sin(i phi)) for each frequency
         """
-        # self.interpolators_cosphi = np.empty((Npols, nof_freq_channels), dtype=object)
-        # self.interpolators_sinphi = np.empty((Npols, nof_freq_channels), dtype=object)
-
-        # self.interpolators_freq_dependent_timing = np.empty((Npols, nof_freq_channels), dtype=object)
-
-        #self.interpolators_timing = np.empty(Npols, dtype=object)
-
-        #self.interpolators_constphase = np.empty(Npols, dtype=object)
-
-        #self.interpolators_cutoff_freq = np.empty(Npols, dtype=object)
+        
 
         if verbose:
             print('Creating %d interpolators total' % (3 * Npols * nof_freq_channels + 3 * Npols), end=' ')
-
-        # Create and initialize the interpolators for all quantities
-        # for freq_channel in range(nof_freq_channels):
-        #     for pol in range(Npols):
-        #         #self.interpolators_abs_spectrum[pol, freq_channel] = interpF.interp2d_fourier(
-        #         #    x, y, self.abs_spectrum[:, freq_channel, pol],
-        #         #    radial_method=radial_method, fill_value='extrapolate' if allow_extrapolation else None
-        #         #)
-        #         # self.interpolators_freq_dependent_timing[pol, freq_channel] = interpF.interp2d_fourier(
-        #         #     x, y, self.freq_dependent_timing[:, freq_channel, pol],
-        #         #     radial_method=radial_method
-        #         # )
-
-        #         self.interpolators_cosphi[pol, freq_channel] = interpF.interp2d_fourier(
-        #             x, y, np.cos(self.phasespectrum_corrected[:, freq_channel, pol]),
-        #             radial_method=radial_method
-        #         )
-        #         self.interpolators_sinphi[pol, freq_channel] = interpF.interp2d_fourier(
-        #             x, y, np.sin(self.phasespectrum_corrected[:, freq_channel, pol]),
-        #             radial_method=radial_method
-        #         )
 
         # Interpolators that return array with dimension [pol]
         self.interpolator_timing = interpF.interp2d_fourier(x, y, self.pulse_timings)
         self.interpolator_constphase = interpF.interp2d_fourier(x, y, self.const_phases)
         self.interpolator_cutoff_freq = interpF.interp2d_fourier(x, y, self.cutoff_freq)
-
-
-        # for pol in range(Npols):
-        #     self.interpolators_timing[pol] = interpF.interp2d_fourier(x, y, self.pulse_timings[:, pol])
-        #     self.interpolators_constphase[pol] = interpF.interp2d_fourier(x, y, self.const_phases[:, pol])
-        #     self.interpolators_cutoff_freq[pol] = interpF.interp2d_fourier(x, y, self.cutoff_freq[:, pol])
 
         if signals_start_times is not None:
             self.interpolators_arrival_times = interpF.interp2d_fourier(x, y, signals_start_times)
@@ -660,8 +620,6 @@ class interp2d_signal:
         self.nofcalls += 1
 
         # change to self.Nfreqs, self.Npols
-        #Nfreqs = len(self.interpolators_abs_spectrum[0])
-        #Npols = len(self.interpolators_abs_spectrum)
         Nfreqs, Npols = self.Nfreqs, self.Npols # todo remove / change below
 
         freqs = np.fft.rfftfreq(self.trace_length, d=self.sampling_period)
@@ -685,22 +643,20 @@ class interp2d_signal:
             Do nearest-neighbor interpolation on remaining ('corrected') phases, which should be near zero, 
             but do full interpolation on amplitude spectrum
             """
-            for freq_channel in range(Nfreqs):
-                for pol in range(Npols):  # TODO: reduce
-                    thisPower = self.interpolators_abs_spectrum[pol, freq_channel](x, y)
-                    abs_spectrum[freq_channel, pol] = thisPower
+
+            abs_interpolated = self.interpolator_abs_spectrum(x, y)   # (Nfreqs, Npols)
+            abs_spectrum[0:Nfreqs, :] = abs_interpolated # only first Nfreqs frequencies!
 
             # Account for freq dependent timings, which are interpolated first to (x, y)
+
+            freq_dependent_timing = self.interpolators_freq_dependent_timing(x, y)
             for freq_channel in range(Nfreqs):
                 for pol in range(Npols):
-                    this_timing = self.interpolators_freq_dependent_timing[pol, freq_channel](x, y)
-                    this_phaseshift = -1.0e6 * self.freqs[freq_channel] * 2 * np.pi * this_timing
+                    #this_timing = self.interpolators_freq_dependent_timing[pol, freq_channel](x, y)
+                    this_phaseshift = -1.0e6 * self.freqs[freq_channel] * 2 * np.pi * freq_dependent_timing[freq_channel, pol]
                     phasespectrum[freq_channel, pol] += this_phaseshift
 
-        elif self.method == 'phasor':
-            #abs_spectrum = np.zeros((self.Nfreqs_full, Npols))
-            #phase_spectrum = np.zeros((self.Nfreqs_full, Npols))
-            
+        elif self.method == 'phasor': 
             abs_interpolated = self.interpolator_abs_spectrum(x, y)   # (Nfreqs, Npols)
             real_part = self.interpolator_cosphi(x, y)                 # (Nfreqs, Npols)
             imag_part = self.interpolator_sinphi(x, y)                 # (Nfreqs, Npols)
@@ -712,19 +668,6 @@ class interp2d_signal:
             phasespectrum[0:Nfreqs, :] = np.arctan2(imag_part, real_part)
             # faster than np.angle, apparently, no complex numbers created
             
-            # for freq_channel in range(Nfreqs):
-            #     for pol in range(Npols):
-            #         # Interpolate abs-amplitude spectrum and phasors
-            #         thisPower = self.interpolators_abs_spectrum[pol, freq_channel](x, y)
-            #         this_realpart = self.interpolators_cosphi[pol, freq_channel](x, y)
-            #         this_imagpart = self.interpolators_sinphi[pol, freq_channel](x, y)
-
-            #         thisPhase = np.angle(this_realpart + 1.0j * this_imagpart)
-            #         # making unit vector by dividing by abs(re**2 + im**2) and multiplying that may be significantly faster
-
-            #         abs_spectrum[freq_channel, pol] = thisPower
-            #         phasespectrum[freq_channel, pol] = thisPhase
-
         else:
             raise ValueError('Unknown reconstruction method: %s' % self.method)
 
@@ -768,27 +711,7 @@ class interp2d_signal:
 
         # Constant phase
         phasespectrum += const_phases[None, :]
-
-
-        # for pol in range(Npols):
-        #     timings[pol] = self.interpolators_timing[pol](x, y)
-        #     const_phases[pol] = self.interpolators_constphase[pol](x, y)
-        #     # Account for timing
-        #     if pulse_centered:
-        #         # move pulse to the center of the trace
-        #         time_delta = self.trace_length * 0.5 * self.sampling_period
-        #         phase_shifts = -1.0e6 * freqs * 2 * np.pi * time_delta
-        #         phasespectrum[:, pol] += phase_shifts
-        #     if account_for_timing:
-        #         phase_shifts = -1.0e6 * freqs * 2 * np.pi * timings[pol]
-        #         phasespectrum[:, pol] += phase_shifts
-        #     else:
-        #         phase_shifts = -1.0e6 * freqs * 2 * np.pi * const_time_offset
-        #         phasespectrum[:, pol] += phase_shifts
-
-        #     # Account for constant phase
-        #     phasespectrum[:, pol] += const_phases[pol]
-
+        
         # Wrap into (-pi, pi) where needed, to tidy up
         phasespectrum = self.phase_wrap(phasespectrum)
         """

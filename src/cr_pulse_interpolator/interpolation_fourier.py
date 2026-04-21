@@ -184,31 +184,12 @@ class interp2d_fourier:
         angle = phi[..., None] * mult
         angle = angle[(...,) + (None,) * self._n_value_dims]
 
+        # The Fourier sum done explicitly, as sum_k( c_k cos(k phi) + s_k sin(k phi) )
         result = np.sum(
             cos_components[..., 0:limit] * np.cos(angle)
             + sin_components[..., 0:limit] * np.sin(angle),
             axis=fourier_axis
         )
-
-
-        # angle = phi[..., None] * mult
-        # angle = angle[(...,) + (None,) * self._n_value_dims]
-        # print(angle) 
-        # result = np.sum(
-        #     cos_components[..., :limit, :] * np.cos(angle)
-        #     + sin_components[..., :limit, :] * np.sin(angle),
-        #     axis=1)
-
-
-
-        # The Fourier sum done explicitly, as sum_k( c_k cos(k phi) + s_k sin(k phi) )
-        # result = np.zeros_like(radius)
-        # if isinstance(phi, float):
-        #     result += np.sum(cos_components[..., 0:limit] * np.cos(phi * mult))
-        #     result += np.sum(sin_components[..., 0:limit] * np.sin(phi * mult))
-        # else:
-        #     result += np.sum(cos_components[..., 0:limit] * np.cos(phi[..., np.newaxis] * mult), axis=-1)
-        #     result += np.sum(sin_components[..., 0:limit] * np.sin(phi[..., np.newaxis] * mult), axis=-1)
 
         return result
 
