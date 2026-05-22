@@ -1,19 +1,15 @@
 # Demonstration script for interpolation_Fourier.py
 # Author: A. Corstanje, (a.corstanje@astro.ru.nl), 2023
 
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 # plt.ion()
 from matplotlib import cm
 
-import jax
-jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_platform_name", "cpu")
+import cr_pulse_interpolator.interpolation_fourier as interpF
 
-import cr_pulse_interpolator.jax.interpolation_fourier as interpF
-# import cr_pulse_interpolator.interpolation_fourier as interpF
-
-def do_plot_radial(interp_fourier, max_mode=2):
+def do_plot_radial(interp_fourier, max_mode=2, fig_path=None):
     radial_interpolator = interp_fourier.get_angular_FFT_interpolator()
     fourier = interp_fourier.get_angular_FFT()
     radial_axis = interp_fourier.get_radial_axis()
@@ -40,6 +36,8 @@ def do_plot_radial(interp_fourier, max_mode=2):
     plt.legend(loc='best')
     plt.xlabel('Radial distance [ m ]')
     plt.ylabel('Value')
+    if fig_path is not None:
+        plt.savefig(os.path.join(fig_path, 'radial_dependence.png'), dpi=300, bbox_inches='tight')
 
     plt.figure() # Sine modes
     for k in range(1, max_mode+1):
@@ -50,9 +48,11 @@ def do_plot_radial(interp_fourier, max_mode=2):
     plt.legend(loc='best')
     plt.xlabel('Radial distance [ m ]')
     plt.ylabel('Value')
+    if fig_path is not None:
+        plt.savefig(os.path.join(fig_path, 'radial_dependence_sin.png'), dpi=300, bbox_inches='tight')
 
 
-def do_plot_angular(interp_fourier, fixed_radius, values_for_radius):
+def do_plot_angular(interp_fourier, fixed_radius, values_for_radius, fig_path=None):
     # Plots angular interpolation at a fixed radius.
     # Inputs: instance of interp2d_fourier, the fixed radius, and 1D-array of values for that radius
     phi_steps = len(values_for_radius)
@@ -74,18 +74,23 @@ def do_plot_angular(interp_fourier, fixed_radius, values_for_radius):
     plt.xlabel('Phi [ deg ]')
     plt.ylabel('Value')
     plt.legend(loc='best')
+    if fig_path is not None:
+        plt.savefig(os.path.join(fig_path, 'angular_dependence_r%3.1f.png' % fixed_radius), dpi=300, bbox_inches='tight')
 
 
 fname = 'sample_data.txt'
+fig_path = os.path.join(os.path.dirname(__file__), 'demo_images_fourier')
+if not os.path.exists(fig_path):
+    os.makedirs(fig_path)
 data = np.loadtxt(fname)
 (x, y, values) = data.T
 
 ### Get instance of interpolator, using given values for (x, y)
-fourier_interpolator = interpF.interp2d_fourier(x, y, values, fill_value=True)
+fourier_interpolator = interpF.interp2d_fourier(x, y, values)
 ###
 
 # Plot radial dependence of the lowest Fourier components
-do_plot_radial(fourier_interpolator)
+do_plot_radial(fourier_interpolator, fig_path=fig_path)
 
 # Plot angular interpolation at two fixed radii
 all_radius = np.sqrt(x**2 + y**2)
@@ -94,7 +99,7 @@ radius_values = all_radius[ordering_indices][:, 0] # unique radius values
 for radius_stepnr in [4, 7]:
     fixed_radius = radius_values[radius_stepnr]
     values_for_radius = values[ordering_indices][radius_stepnr, :]
-    do_plot_angular(fourier_interpolator, fixed_radius, values_for_radius)
+    do_plot_angular(fourier_interpolator, fixed_radius, values_for_radius, fig_path=fig_path)
 
 # Make color plot of f(x, y), using a meshgrid
 dist_scale = 250.0
@@ -125,4 +130,4 @@ ax.set_ylim(-250, 250)
 ax.set_aspect('equal')
 
 # plt.show()
-plt.savefig("./image_jax.png")
+plt.savefig(os.path.join(fig_path, 'interpolated_footprint.png'), bbox_inches='tight')
