@@ -58,20 +58,23 @@ class interp2d_fourier:
     """
 
     @classmethod
-    def cos_sin_components(cls, fourier):
-        """
-        Convert complex FFT as from np.fft.rfft to real-valued cos, sin components.
-
-        Parameters
-        -----------
-        fourier : np.ndarray
-            complex Fourier components, with Fourier series running along the last axis.
-        """
+    def cos_sin_components(cls, fourier, axis=-1):
+        """Convert complex FFT to real-valued cos, sin components.
+        `axis` selects which axis holds the Fourier modes (last for 1D NumPy data,
+        1 for multi-D JAX batched output)."""
         cos_components = 2 * jnp.real(fourier)
-        cos_components = cos_components.at[..., 0].set(cos_components[..., 0] * 0.5)
-        cos_components = cos_components.at[..., -1].set(cos_components[..., -1] * 0.5)
+        # Build index tuples to select element 0 and -1 along `axis`
+        sl_first = [slice(None)] * fourier.ndim
+        sl_last  = [slice(None)] * fourier.ndim
+        sl_first[axis] = 0
+        sl_last[axis]  = -1
+        cos_components = cos_components.at[tuple(sl_first)].set(
+            cos_components[tuple(sl_first)] * 0.5
+        )
+        cos_components = cos_components.at[tuple(sl_last)].set(
+            cos_components[tuple(sl_last)] * 0.5
+        )
         sin_components = -2 * jnp.imag(fourier)
-
         return cos_components, sin_components
 
     def __init__(
@@ -169,7 +172,9 @@ class interp2d_fourier:
         fourier_len = fourier.shape[fourier_comp_axis]
 
         # convert to cos/sin
-        cos_components, sin_components = interp2d_fourier.cos_sin_components(fourier)
+        cos_components, sin_components = interp2d_fourier.cos_sin_components(
+    fourier, axis=fourier_comp_axis   # fourier_comp_axis = 1 for non-meshgrid
+)
 
         # determine Fourier mode multipliers
         limit = (max_fourier_mode + 1) if (max_fourier_mode is not None) else fourier_len
@@ -180,7 +185,10 @@ class interp2d_fourier:
         fourier_summer = batched_fourier_sum if self._meshgrid_flag else batched_fourier_sum_1d
 
         # compute sum_k( c_k cos(k phi) + s_k sin(k phi) )
-        result = fourier_summer(phi_k, cos_components[..., 0:limit], sin_components[..., 0:limit])
+        # Slice on the Fourier modes axis, not the last axis
+        sl = [slice(None)] * cos_components.ndim
+        sl[fourier_comp_axis] = slice(0, limit)
+        result = fourier_summer(phi_k, cos_components[tuple(sl)], sin_components[tuple(sl)])
 
         return result
 

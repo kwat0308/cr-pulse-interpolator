@@ -1,6 +1,8 @@
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+import numpy as np
+from typing import Any, Type, Union
 import interpax
 from functools import partial
 
@@ -8,10 +10,11 @@ def linear_interp(x, xp, fp):
     return interpax.interp1d(xq=x, f=fp, x=xp, method='linear', extrap=True)
 
 def cubic_interp(x, xp, fp):
-    return interpax.interp1d(xq=x, f=fp, x=xp, method='cubic2', extrap=True)
+    return interpax.interp1d(xq=x, f=fp, x=xp, method='cubic', extrap=True)
 
 def cubic_interp_amplitude(x, xp, fp):
-    return interpax.interp1d(xq=x, f=fp, x=xp, method='cubic2', extrap=(fp[0], 0.0))
+    return interpax.interp1d(xq=x, f=fp, x=xp, method='cubic', extrap=(fp[0], 0.0))
+    
 
 def batched_fourier_interp_1d(rad, rad_grid, fft_grid):
     """
