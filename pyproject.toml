@@ -27,6 +27,7 @@ jax = [
   "jax",
   "jaxlib",
   "interpax",
+  "jax_radio_tools"
 ]
 
 [project.urls]
